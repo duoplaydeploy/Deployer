@@ -26,6 +26,26 @@ if (!TG_TOKEN || !TG_CHAT) {
 const provider = new ethers.JsonRpcProvider(RPC);
 const bot = new TelegramBot(TG_TOKEN, { polling: false });
 
+// NOXA launchpad ka treasury — iska involvement = noxa token
+const NOXA_TREASURY = "0x71f2f1c2dc94cdabfe29cb355119f8683ae0969b";
+const EXCLUDE_NOXA = (process.env.EXCLUDE_NOXA || "true") === "true";
+
+// noxa se aaye token/pool addresses yaad rakho (liquidity alerts skip karne ke liye)
+const noxaAddrs = new Set();
+
+// tx receipt ke logs me noxa treasury hai kya?
+function isNoxaTx(receipt) {
+  const t = NOXA_TREASURY;
+  for (const log of receipt.logs || []) {
+    if (log.address?.toLowerCase() === t) return true;
+    for (const topic of log.topics || []) {
+      if ("0x" + topic.slice(26).toLowerCase() === t) return true;
+    }
+  }
+  return false;
+}
+
+
 // ---------- ERC20 + classification ----------
 const ERC20_ABI = [
   "function name() view returns (string)",
@@ -39,6 +59,18 @@ const POOL_ABI = [
   "function token0() view returns (address)",
   "function token1() view returns (address)",
 ];
+
+// Pool ke andar koi noxa token hai kya?
+async function poolIsNoxa(poolAddr) {
+  if (noxaAddrs.has(poolAddr.toLowerCase())) return true;
+  try {
+    const pool = new ethers.Contract(poolAddr, POOL_ABI, provider);
+    const [t0, t1] = await Promise.all([pool.token0(), pool.token1()]);
+    return noxaAddrs.has(t0.toLowerCase()) || noxaAddrs.has(t1.toLowerCase());
+  } catch {
+    return false;
+  }
+}
 
 // Base/quote tokens ko skip karo taaki asli token dikhe (WETH, USDC, etc.)
 const BASE_SYMBOLS = /^(weth|eth|usdc|usdt|dai|wbtc)$/i;
@@ -152,11 +184,17 @@ async function notifyDeploy(tx, receipt) {
 
   if (!info.isToken) return; // skip non-token contracts — only tokens wanted
 
+  const isNoxa = isNoxaTx(receipt);
+  if (isNoxa) noxaAddrs.add(addr.toLowerCase());
+  const header = isNoxa
+    ? `🟢 *NOXA FUN DEPLOY*\n🚀 *New token deployed*`
+    : `🚀 *New token deployed*`;
+
   const verified = await isVerified(addr);
   const tag = classify({ ...info, verified });
 
   await send(
-    `🚀 *New token deployed* (${tag})\n\n` +
+    `${header} (${tag})\n\n` +
     `Name: *${info.name}*\n` +
     `Ticker: *${info.symbol}*\n` +
     `Supply: ${fmtSupply(info.supply, info.decimals)}\n` +
@@ -168,6 +206,8 @@ async function notifyDeploy(tx, receipt) {
 }
 
 async function notifyLiquidity(log, kind) {
+  // noxa pool hai to liquidity alert mat bhejo
+  if (await poolIsNoxa(log.address)) return;
   // "new pool"/"new pair" same address ke liye ek hi baar bhejo
   if (kind === "new pool" || kind === "new pair") {
     const key = log.address.toLowerCase();
@@ -184,6 +224,8 @@ async function notifyLiquidity(log, kind) {
 }
 
 async function notifyBurnLock(log, kind) {
+  // noxa pool hai to skip
+  if (await poolIsNoxa(log.address)) return;
   // dobara same LP na bheje
   const key = `${kind}:${log.address.toLowerCase()}`;
   if (seenPools.has(key)) return;
