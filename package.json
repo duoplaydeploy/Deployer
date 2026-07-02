@@ -1,0 +1,16 @@
+{
+  "name": "rh-chain-watcher",
+  "version": "1.0.0",
+  "description": "Robinhood Chain contract & liquidity watcher for Telegram",
+  "main": "deploy-watcher.js",
+  "scripts": {
+    "start": "node deploy-watcher.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ethers": "^6.13.0",
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}

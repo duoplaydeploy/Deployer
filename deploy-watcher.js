@@ -1,0 +1,198 @@
+// deploy-watcher.js — Robinhood Chain contract & liquidity watcher → Telegram
+//
+// Setup:
+//   npm install ethers node-telegram-bot-api
+//   1) Create a bot via @BotFather, get the token.
+//   2) Add the bot as admin to your channel.
+//   3) Get your chat id: post in the channel, then open
+//      https://api.telegram.org/bot<TOKEN>/getUpdates  and read chat.id
+//   4) Run:  TG_TOKEN=xxx TG_CHAT=-100xxxx node deploy-watcher.js
+//
+const { ethers } = require("ethers");
+const TelegramBot = require("node-telegram-bot-api");
+
+// ---------- config ----------
+const RPC = process.env.RPC || "https://rpc.mainnet.chain.robinhood.com";
+const EXPLORER = process.env.EXPLORER || "https://robinhoodchain.blockscout.com";
+const TG_TOKEN = process.env.TG_TOKEN;
+const TG_CHAT = process.env.TG_CHAT;
+const POLL_MS = Number(process.env.POLL_MS || 2000);
+
+if (!TG_TOKEN || !TG_CHAT) {
+  console.error("Set TG_TOKEN and TG_CHAT env vars.");
+  process.exit(1);
+}
+
+const provider = new ethers.JsonRpcProvider(RPC);
+const bot = new TelegramBot(TG_TOKEN, { polling: false });
+
+// ---------- ERC20 + classification ----------
+const ERC20_ABI = [
+  "function name() view returns (string)",
+  "function symbol() view returns (string)",
+  "function decimals() view returns (uint8)",
+  "function totalSupply() view returns (uint256)",
+];
+
+const MEME_WORDS = /(doge?|inu|shib|pepe|elon|moon|floki|wojak|chad|meme|baby|safe|cum|cat|frog|bonk|wif|turbo|degen|rekt|ape|pump|\bhood\b|gme|wsb|tendies|stonk)/i;
+const UTILITY_WORDS = /(gov|dao|stake|vault|protocol|finance|swap|lend|oracle|bridge|usd|eth|wrapped|staked|reward|index|liquidity|yield)/i;
+
+function classify({ name, symbol, supply, decimals, verified }) {
+  const hay = `${name} ${symbol}`.toLowerCase();
+  let score = 0;
+  if (MEME_WORDS.test(hay)) score += 2;
+  const human = Number(supply) / 10 ** Number(decimals || 18);
+  if (human >= 1e9) score += 1;      // billions+
+  if (human >= 1e12) score += 1;     // trillions+ strong meme tell
+  if (!verified) score += 1;         // unverified leans meme
+  if (UTILITY_WORDS.test(hay)) score -= 2;
+  if (verified) score -= 1;          // verified leans utility
+  if (score >= 3) return "meme";
+  if (score <= 0) return "utility";
+  return "meme?";
+}
+
+// ---------- Blockscout verification check ----------
+async function isVerified(addr) {
+  try {
+    const res = await fetch(`${EXPLORER}/api/v2/smart-contracts/${addr}`);
+    if (!res.ok) return false;
+    const j = await res.json();
+    return Boolean(j.is_verified || j.name);
+  } catch {
+    return false;
+  }
+}
+
+async function readToken(addr) {
+  const c = new ethers.Contract(addr, ERC20_ABI, provider);
+  try {
+    const [name, symbol, decimals, supply] = await Promise.all([
+      c.name(), c.symbol(), c.decimals(), c.totalSupply(),
+    ]);
+    return { name, symbol, decimals, supply, isToken: true };
+  } catch {
+    return { isToken: false };
+  }
+}
+
+// ---------- liquidity event topics ----------
+const TOPICS = {
+  V2_MINT: ethers.id("Mint(address,uint256,uint256)"),
+  V3_MINT: ethers.id("Mint(address,address,int24,int24,uint128,uint256,uint256)"),
+  PAIR_CREATED: ethers.id("PairCreated(address,address,address,uint256)"),
+  POOL_CREATED: ethers.id("PoolCreated(address,address,uint24,int24,address)"),
+};
+
+// ---------- telegram send (with retry) ----------
+async function send(text) {
+  for (let i = 0; i < 3; i++) {
+    try {
+      await bot.sendMessage(TG_CHAT, text, {
+        parse_mode: "Markdown",
+        disable_web_page_preview: true,
+      });
+      return;
+    } catch (e) {
+      if (i === 2) console.error("tg send failed:", e.message);
+      else await new Promise((r) => setTimeout(r, 1000 * (i + 1)));
+    }
+  }
+}
+
+function fmtSupply(supply, decimals) {
+  const human = Number(supply) / 10 ** Number(decimals || 18);
+  return human.toLocaleString("en-US", { maximumFractionDigits: 0 });
+}
+
+// ---------- notifiers ----------
+async function notifyDeploy(tx, receipt) {
+  const addr = receipt.contractAddress;
+  const info = await readToken(addr);
+
+  if (!info.isToken) {
+    await send(
+      `🚀 *New contract deployed*\n\n` +
+      `Address: \`${addr}\`\n` +
+      `Deployer: \`${tx.from}\`\n` +
+      `[Tx](${EXPLORER}/tx/${tx.hash}) · [Contract](${EXPLORER}/address/${addr})`
+    );
+    return;
+  }
+
+  const verified = await isVerified(addr);
+  const tag = classify({ ...info, verified });
+
+  await send(
+    `🚀 *New token deployed* (${tag})\n\n` +
+    `Name: *${info.name}*\n` +
+    `Ticker: *${info.symbol}*\n` +
+    `Supply: ${fmtSupply(info.supply, info.decimals)}\n` +
+    `Verified: ${verified ? "yes" : "no"}\n` +
+    `Address: \`${addr}\`\n` +
+    `Deployer: \`${tx.from}\`\n` +
+    `[Tx](${EXPLORER}/tx/${tx.hash}) · [Contract](${EXPLORER}/address/${addr})`
+  );
+}
+
+async function notifyLiquidity(log, kind) {
+  await send(
+    `💧 *Liquidity event: ${kind}*\n\n` +
+    `Pool/Pair: \`${log.address}\`\n` +
+    `[Tx](${EXPLORER}/tx/${log.transactionHash}) · [Contract](${EXPLORER}/address/${log.address})`
+  );
+}
+
+// ---------- block scanner ----------
+async function scanBlock(blockNumber) {
+  const block = await provider.getBlock(blockNumber, true);
+  if (!block) return;
+
+  // 1) contract deployments
+  for (const tx of block.prefetchedTransactions) {
+    if (tx.to === null) {
+      const receipt = await provider.getTransactionReceipt(tx.hash);
+      if (receipt?.contractAddress && receipt.status === 1) {
+        await notifyDeploy(tx, receipt);
+      }
+    }
+  }
+
+  // 2) liquidity events
+  const logs = await provider.getLogs({
+    fromBlock: blockNumber,
+    toBlock: blockNumber,
+    topics: [[TOPICS.V2_MINT, TOPICS.V3_MINT, TOPICS.PAIR_CREATED, TOPICS.POOL_CREATED]],
+  });
+  for (const log of logs) {
+    const t = log.topics[0];
+    if (t === TOPICS.V2_MINT) await notifyLiquidity(log, "V2 add");
+    else if (t === TOPICS.V3_MINT) await notifyLiquidity(log, "V3 add");
+    else if (t === TOPICS.PAIR_CREATED) await notifyLiquidity(log, "new pair");
+    else if (t === TOPICS.POOL_CREATED) await notifyLiquidity(log, "new pool");
+  }
+}
+
+// ---------- main loop ----------
+async function main() {
+  let last = await provider.getBlockNumber();
+  console.log(`Watching ${RPC} from block ${last}`);
+  await send(`✅ Robinhood Chain watcher online. Starting at block ${last}.`);
+
+  let busy = false;
+  setInterval(async () => {
+    if (busy) return;          // avoid overlapping polls
+    busy = true;
+    try {
+      const head = await provider.getBlockNumber();
+      for (let n = last + 1; n <= head; n++) await scanBlock(n);
+      last = head;
+    } catch (e) {
+      console.error("poll error:", e.message);
+    } finally {
+      busy = false;
+    }
+  }, POLL_MS);
+}
+
+main();
