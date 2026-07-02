@@ -184,9 +184,24 @@ async function notifyLiquidity(log, kind) {
 }
 
 async function notifyBurnLock(log, kind) {
+  // dobara same LP na bheje
+  const key = `${kind}:${log.address.toLowerCase()}`;
+  if (seenPools.has(key)) return;
+
+  // 0-amount (dust) transfers skip karo
+  try {
+    const amount = BigInt(log.data);
+    if (amount === 0n) return;
+  } catch { /* data padha nahi gaya to aage badho */ }
+
+  // sirf tab bolo "liquidity" jab ye sach me pool/LP token ho
+  const label = await poolTokenLabel(log.address);
+  if (!label) return; // pool nahi hai = normal token burn, ignore
+
+  seenPools.add(key);
   const emoji = kind === "burnt" ? "🔥" : "🔒";
   await send(
-    `${emoji} *Liquidity ${kind}*\n\n` +
+    `${emoji} *Liquidity ${kind}*\nToken: ${label}\n\n` +
     `LP token: \`${log.address}\`\n` +
     `[Tx](${EXPLORER}/tx/${log.transactionHash}) · [Contract](${EXPLORER}/address/${log.address})`
   );
