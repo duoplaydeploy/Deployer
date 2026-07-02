@@ -37,19 +37,11 @@ const ERC20_ABI = [
 const MEME_WORDS = /(doge?|inu|shib|pepe|elon|moon|floki|wojak|chad|meme|baby|safe|cum|cat|frog|bonk|wif|turbo|degen|rekt|ape|pump|\bhood\b|gme|wsb|tendies|stonk)/i;
 const UTILITY_WORDS = /(gov|dao|stake|vault|protocol|finance|swap|lend|oracle|bridge|usd|eth|wrapped|staked|reward|index|liquidity|yield)/i;
 
-function classify({ name, symbol, supply, decimals, verified }) {
+function classify({ name, symbol }) {
   const hay = `${name} ${symbol}`.toLowerCase();
-  let score = 0;
-  if (MEME_WORDS.test(hay)) score += 2;
-  const human = Number(supply) / 10 ** Number(decimals || 18);
-  if (human >= 1e9) score += 1;      // billions+
-  if (human >= 1e12) score += 1;     // trillions+ strong meme tell
-  if (!verified) score += 1;         // unverified leans meme
-  if (UTILITY_WORDS.test(hay)) score -= 2;
-  if (verified) score -= 1;          // verified leans utility
-  if (score >= 3) return "meme";
-  if (score <= 0) return "utility";
-  return "meme?";
+  if (UTILITY_WORDS.test(hay)) return "utility";
+  if (MEME_WORDS.test(hay)) return "meme";
+  return "meme?"; // naam se pata nahi chala
 }
 
 // ---------- Blockscout verification check ----------
@@ -82,7 +74,23 @@ const TOPICS = {
   V3_MINT: ethers.id("Mint(address,address,int24,int24,uint128,uint256,uint256)"),
   PAIR_CREATED: ethers.id("PairCreated(address,address,address,uint256)"),
   POOL_CREATED: ethers.id("PoolCreated(address,address,uint24,int24,address)"),
+  TRANSFER: ethers.id("Transfer(address,address,uint256)"),
 };
+
+// LP tokens yahan bheje = liquidity locked/burnt
+const DEAD_ADDRS = new Set([
+  "0x0000000000000000000000000000000000000000", // zero (burn)
+  "0x000000000000000000000000000000000000dead", // dead (burn)
+]);
+// Known LP locker contracts (lowercase). Naye milne pe yahan add kar.
+const LOCKER_ADDRS = new Set([
+  // "0x...unicrypt", "0x...team_finance", etc.
+]);
+
+function topicAddr(topic) {
+  // 32-byte topic ka last 20 bytes = address
+  return "0x" + topic.slice(26).toLowerCase();
+}
 
 // ---------- telegram send (with retry) ----------
 async function send(text) {
@@ -110,15 +118,7 @@ async function notifyDeploy(tx, receipt) {
   const addr = receipt.contractAddress;
   const info = await readToken(addr);
 
-  if (!info.isToken) {
-    await send(
-      `🚀 *New contract deployed*\n\n` +
-      `Address: \`${addr}\`\n` +
-      `Deployer: \`${tx.from}\`\n` +
-      `[Tx](${EXPLORER}/tx/${tx.hash}) · [Contract](${EXPLORER}/address/${addr})`
-    );
-    return;
-  }
+  if (!info.isToken) return; // skip non-token contracts — only tokens wanted
 
   const verified = await isVerified(addr);
   const tag = classify({ ...info, verified });
@@ -139,6 +139,15 @@ async function notifyLiquidity(log, kind) {
   await send(
     `💧 *Liquidity event: ${kind}*\n\n` +
     `Pool/Pair: \`${log.address}\`\n` +
+    `[Tx](${EXPLORER}/tx/${log.transactionHash}) · [Contract](${EXPLORER}/address/${log.address})`
+  );
+}
+
+async function notifyBurnLock(log, kind) {
+  const emoji = kind === "burnt" ? "🔥" : "🔒";
+  await send(
+    `${emoji} *Liquidity ${kind}*\n\n` +
+    `LP token: \`${log.address}\`\n` +
     `[Tx](${EXPLORER}/tx/${log.transactionHash}) · [Contract](${EXPLORER}/address/${log.address})`
   );
 }
