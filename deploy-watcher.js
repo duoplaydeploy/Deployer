@@ -34,6 +34,35 @@ const ERC20_ABI = [
   "function totalSupply() view returns (uint256)",
 ];
 
+// Pool/pair contracts expose token0() and token1()
+const POOL_ABI = [
+  "function token0() view returns (address)",
+  "function token1() view returns (address)",
+];
+
+// Base/quote tokens ko skip karo taaki asli token dikhe (WETH, USDC, etc.)
+const BASE_SYMBOLS = /^(weth|eth|usdc|usdt|dai|wbtc)$/i;
+
+// Pool ka main token ka naam/ticker nikaalo
+async function poolTokenLabel(poolAddr) {
+  try {
+    const pool = new ethers.Contract(poolAddr, POOL_ABI, provider);
+    const [t0, t1] = await Promise.all([pool.token0(), pool.token1()]);
+    const [a, b] = await Promise.all([readToken(t0), readToken(t1)]);
+    const parts = [];
+    // base token (WETH/USDC) ko doosre me daalo, main token pehle
+    const main = a.isToken && !BASE_SYMBOLS.test(a.symbol) ? a
+               : b.isToken && !BASE_SYMBOLS.test(b.symbol) ? b : a;
+    const other = main === a ? b : a;
+    if (main?.isToken) parts.push(`*${main.name}* (${main.symbol})`);
+    if (other?.isToken) parts.push(other.symbol);
+    return parts.length ? parts.join(" / ") : null;
+  } catch {
+    return null;
+  }
+}
+
+
 const MEME_WORDS = /(doge?|inu|shib|pepe|elon|moon|floki|wojak|chad|meme|baby|safe|cum|cat|frog|bonk|wif|turbo|degen|rekt|ape|pump|\bhood\b|gme|wsb|tendies|stonk)/i;
 const UTILITY_WORDS = /(gov|dao|stake|vault|protocol|finance|swap|lend|oracle|bridge|usd|eth|wrapped|staked|reward|index|liquidity|yield)/i;
 
@@ -114,6 +143,9 @@ function fmtSupply(supply, decimals) {
 }
 
 // ---------- notifiers ----------
+// Ek hi pool/token dobara na bheje iske liye yaad rakho
+const seenPools = new Set();
+
 async function notifyDeploy(tx, receipt) {
   const addr = receipt.contractAddress;
   const info = await readToken(addr);
@@ -136,8 +168,16 @@ async function notifyDeploy(tx, receipt) {
 }
 
 async function notifyLiquidity(log, kind) {
+  // "new pool"/"new pair" same address ke liye ek hi baar bhejo
+  if (kind === "new pool" || kind === "new pair") {
+    const key = log.address.toLowerCase();
+    if (seenPools.has(key)) return;
+    seenPools.add(key);
+  }
+  const label = await poolTokenLabel(log.address);
+  const head = label ? `\nToken: ${label}` : "";
   await send(
-    `💧 *Liquidity event: ${kind}*\n\n` +
+    `💧 *Liquidity event: ${kind}*${head}\n\n` +
     `Pool/Pair: \`${log.address}\`\n` +
     `[Tx](${EXPLORER}/tx/${log.transactionHash}) · [Contract](${EXPLORER}/address/${log.address})`
   );
@@ -167,11 +207,11 @@ async function scanBlock(blockNumber) {
     }
   }
 
-  // 2) liquidity events
+  // 2) liquidity events + burn/lock (Transfer of LP to dead/locker)
   const logs = await provider.getLogs({
     fromBlock: blockNumber,
     toBlock: blockNumber,
-    topics: [[TOPICS.V2_MINT, TOPICS.V3_MINT, TOPICS.PAIR_CREATED, TOPICS.POOL_CREATED]],
+    topics: [[TOPICS.V2_MINT, TOPICS.V3_MINT, TOPICS.PAIR_CREATED, TOPICS.POOL_CREATED, TOPICS.TRANSFER]],
   });
   for (const log of logs) {
     const t = log.topics[0];
@@ -179,6 +219,11 @@ async function scanBlock(blockNumber) {
     else if (t === TOPICS.V3_MINT) await notifyLiquidity(log, "V3 add");
     else if (t === TOPICS.PAIR_CREATED) await notifyLiquidity(log, "new pair");
     else if (t === TOPICS.POOL_CREATED) await notifyLiquidity(log, "new pool");
+    else if (t === TOPICS.TRANSFER && log.topics.length === 3) {
+      const to = topicAddr(log.topics[2]);
+      if (DEAD_ADDRS.has(to)) await notifyBurnLock(log, "burnt");
+      else if (LOCKER_ADDRS.has(to)) await notifyBurnLock(log, "locked");
+    }
   }
 }
 
