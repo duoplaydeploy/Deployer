@@ -1,12 +1,12 @@
-// deploy-watcher.js — Robinhood Chain contract & liquidity watcher → Telegram
+// deploy-watcher.js — Robinhood Chain token watcher → Telegram (card-style alerts)
 //
 // Setup:
 //   npm install ethers node-telegram-bot-api
-//   1) Create a bot via @BotFather, get the token.
-//   2) Add the bot as admin to your channel.
-//   3) Get your chat id: post in the channel, then open
-//      https://api.telegram.org/bot<TOKEN>/getUpdates  and read chat.id
-//   4) Run:  TG_TOKEN=xxx TG_CHAT=-100xxxx node deploy-watcher.js
+//   Run:  TG_TOKEN=xxx TG_CHAT=-100xxxx node deploy-watcher.js
+//
+// Env switches:
+//   EXCLUDE_NOXA=false  -> show NOXA Fun launch cards (default: true = NOXA fully hidden)
+//   RPC / EXPLORER / POLL_MS as before
 //
 const { ethers } = require("ethers");
 const TelegramBot = require("node-telegram-bot-api");
@@ -26,83 +26,65 @@ if (!TG_TOKEN || !TG_CHAT) {
 const provider = new ethers.JsonRpcProvider(RPC);
 const bot = new TelegramBot(TG_TOKEN, { polling: false });
 
-// NOXA launchpad ka treasury — iska involvement = noxa token
-const NOXA_TREASURY = "0x71f2f1c2dc94cdabfe29cb355119f8683ae0969b";
+// ---------- NOXA Fun launchpad ----------
+// Official NOXA Launch Factory on Robinhood Chain (chain id 4663)
+// Source: https://docs.noxa.fi/contracts/noxa-fun/
+const NOXA_FACTORY = (
+  process.env.NOXA_FACTORY || "0xD9eC2db5f3D1b236843925949fe5bd8a3836FCcB"
+).toLowerCase();
+
+// Toggle: default true = NOXA fully hidden (it has its own platform).
+// Set EXCLUDE_NOXA=false in Railway if you ever want NOXA launch cards back.
 const EXCLUDE_NOXA = (process.env.EXCLUDE_NOXA || "true") === "true";
 
-// noxa se aaye token/pool addresses yaad rakho (liquidity alerts skip karne ke liye)
+// Factory event emitted on every NOXA launch
+// Source: https://docs.noxa.fi/integrations/launchpad/
+const NOXA_IFACE = new ethers.Interface([
+  "event TokenLaunched(address indexed token, address indexed deployer, address indexed dexFactory, address pairToken, address pool, uint256 dexId, uint256 launchConfigId, uint256 positionId, uint256 restrictionsEndBlock, uint256 initialBuyAmount)",
+]);
+const TOKEN_LAUNCHED_TOPIC = NOXA_IFACE.getEvent("TokenLaunched").topicHash;
+
+// Legacy treasury heuristic (fallback for direct deploys touching NOXA)
+const NOXA_TREASURY = "0x71f2f1c2dc94cdabfe29cb355119f8683ae0969b";
+
+// NOXA token/pool addresses we've seen (suppress duplicate generic alerts)
 const noxaAddrs = new Set();
 
-// tx receipt ke logs me noxa treasury hai kya?
 function isNoxaTx(receipt) {
-  const t = NOXA_TREASURY;
   for (const log of receipt.logs || []) {
-    if (log.address?.toLowerCase() === t) return true;
+    const a = log.address?.toLowerCase();
+    if (a === NOXA_TREASURY || a === NOXA_FACTORY) return true;
     for (const topic of log.topics || []) {
-      if ("0x" + topic.slice(26).toLowerCase() === t) return true;
+      const t = "0x" + topic.slice(26).toLowerCase();
+      if (t === NOXA_TREASURY || t === NOXA_FACTORY) return true;
     }
   }
   return false;
 }
 
-
-// ---------- ERC20 + classification ----------
+// ---------- ERC20 + pool ABIs ----------
 const ERC20_ABI = [
   "function name() view returns (string)",
   "function symbol() view returns (string)",
   "function decimals() view returns (uint8)",
   "function totalSupply() view returns (uint256)",
 ];
-
-// Pool/pair contracts expose token0() and token1()
 const POOL_ABI = [
   "function token0() view returns (address)",
   "function token1() view returns (address)",
 ];
 
-// Pool ke andar koi noxa token hai kya?
-async function poolIsNoxa(poolAddr) {
-  if (noxaAddrs.has(poolAddr.toLowerCase())) return true;
-  try {
-    const pool = new ethers.Contract(poolAddr, POOL_ABI, provider);
-    const [t0, t1] = await Promise.all([pool.token0(), pool.token1()]);
-    return noxaAddrs.has(t0.toLowerCase()) || noxaAddrs.has(t1.toLowerCase());
-  } catch {
-    return false;
-  }
-}
-
-// Base/quote tokens ko skip karo taaki asli token dikhe (WETH, USDC, etc.)
-const BASE_SYMBOLS = /^(weth|eth|usdc|usdt|dai|wbtc)$/i;
-
-// Pool ka main token ka naam/ticker nikaalo
-async function poolTokenLabel(poolAddr) {
-  try {
-    const pool = new ethers.Contract(poolAddr, POOL_ABI, provider);
-    const [t0, t1] = await Promise.all([pool.token0(), pool.token1()]);
-    const [a, b] = await Promise.all([readToken(t0), readToken(t1)]);
-    const parts = [];
-    // base token (WETH/USDC) ko doosre me daalo, main token pehle
-    const main = a.isToken && !BASE_SYMBOLS.test(a.symbol) ? a
-               : b.isToken && !BASE_SYMBOLS.test(b.symbol) ? b : a;
-    const other = main === a ? b : a;
-    if (main?.isToken) parts.push(`*${main.name}* (${main.symbol})`);
-    if (other?.isToken) parts.push(other.symbol);
-    return parts.length ? parts.join(" / ") : null;
-  } catch {
-    return null;
-  }
-}
-
+// Base/quote tokens (WETH, USDC...) — the "other side" of a pair
+const BASE_SYMBOLS = /^(weth|eth|usdc|usdt|dai|wbtc|rbh-eth)$/i;
 
 const MEME_WORDS = /(doge?|inu|shib|pepe|elon|moon|floki|wojak|chad|meme|baby|safe|cum|cat|frog|bonk|wif|turbo|degen|rekt|ape|pump|\bhood\b|gme|wsb|tendies|stonk)/i;
 const UTILITY_WORDS = /(gov|dao|stake|vault|protocol|finance|swap|lend|oracle|bridge|usd|eth|wrapped|staked|reward|index|liquidity|yield)/i;
 
-function classify({ name, symbol }) {
+function classify(name, symbol) {
   const hay = `${name} ${symbol}`.toLowerCase();
   if (UTILITY_WORDS.test(hay)) return "utility";
   if (MEME_WORDS.test(hay)) return "meme";
-  return "meme?"; // naam se pata nahi chala
+  return "meme?";
 }
 
 // ---------- Blockscout verification check ----------
@@ -138,18 +120,15 @@ const TOPICS = {
   TRANSFER: ethers.id("Transfer(address,address,uint256)"),
 };
 
-// LP tokens yahan bheje = liquidity locked/burnt
 const DEAD_ADDRS = new Set([
-  "0x0000000000000000000000000000000000000000", // zero (burn)
-  "0x000000000000000000000000000000000000dead", // dead (burn)
+  "0x0000000000000000000000000000000000000000",
+  "0x000000000000000000000000000000000000dead",
 ]);
-// Known LP locker contracts (lowercase). Naye milne pe yahan add kar.
 const LOCKER_ADDRS = new Set([
-  // "0x...unicrypt", "0x...team_finance", etc.
+  "0x7f03effbd7ceb22a3f80dd468f67ef27826acd85", // NOXA Launch Locker (Robinhood Chain)
 ]);
 
 function topicAddr(topic) {
-  // 32-byte topic ka last 20 bytes = address
   return "0x" + topic.slice(26).toLowerCase();
 }
 
@@ -174,48 +153,33 @@ function fmtSupply(supply, decimals) {
   return human.toLocaleString("en-US", { maximumFractionDigits: 0 });
 }
 
-// ---------- notifiers ----------
-// Ek hi pool/token dobara na bheje iske liye yaad rakho
-const seenPools = new Set();
-
-async function notifyDeploy(tx, receipt) {
-  const addr = receipt.contractAddress;
-  const info = await readToken(addr);
-
-  if (!info.isToken) return; // skip non-token contracts — only tokens wanted
-
-  // NOXA poora skip — deploy bhi nahi dikhega
-  if (isNoxaTx(receipt)) {
-    noxaAddrs.add(addr.toLowerCase());
-    return;
-  }
-
-  const verified = await isVerified(addr);
-  const tag = classify({ ...info, verified });
-
-  // token ka status yaad rakho (checklist ke liye)
-  tokenStatus.set(addr.toLowerCase(), {
-    name: info.name, symbol: info.symbol,
-    deployed: true, verified, launching: false, lp: false,
-  });
-
-  await send(
-    `🆕 *NEW TOKEN* (${tag})\n\n` +
-    `Name: *${info.name}*\n` +
-    `Ticker: *${info.symbol}*\n` +
-    `Supply: ${fmtSupply(info.supply, info.decimals)}\n\n` +
-    statusChecklist(addr.toLowerCase()) + `\n\n` +
-    `Address: \`${addr}\`\n` +
-    `Deployer: \`${tx.from}\`\n` +
-    `[Tx](${EXPLORER}/tx/${tx.hash}) · [Contract](${EXPLORER}/address/${addr})`
-  );
-}
-
-// har token ka progress: deployed -> verified -> launching -> lp locked/burned
+// ---------- per-token status (for the ✅/❌ checklist) ----------
+// addr(lower) -> { name, symbol, supplyStr, deployer, pool,
+//                  deployed, verified, launching, lp, isToken, noxa }
 const tokenStatus = new Map();
 
+async function getStatus(addr, patch = {}) {
+  const key = addr.toLowerCase();
+  let s = tokenStatus.get(key);
+  if (!s) {
+    const info = await readToken(addr);
+    s = {
+      name: info.isToken ? info.name : "?",
+      symbol: info.isToken ? info.symbol : "?",
+      supplyStr: info.isToken ? fmtSupply(info.supply, info.decimals) : null,
+      isToken: info.isToken,
+      deployer: null, pool: null, noxa: false,
+      deployed: true, verified: false, launching: false, lp: false,
+    };
+    s.verified = await isVerified(addr);
+    tokenStatus.set(key, s);
+  }
+  Object.assign(s, patch);
+  return s;
+}
+
 function statusChecklist(addr) {
-  const s = tokenStatus.get(addr) || {};
+  const s = tokenStatus.get(addr.toLowerCase()) || {};
   const row = (ok, n, title, sub) =>
     `${ok ? "✅" : "❌"} *#${n} ${title}*\n     _${sub}_`;
   return [
@@ -226,67 +190,190 @@ function statusChecklist(addr) {
   ].join("\n");
 }
 
-async function notifyLiquidity(log, kind) {
-  const key = log.address.toLowerCase();
-  // noxa pool hai to liquidity alert mat bhejo
-  if (noxaAddrs.has(key) || await poolIsNoxa(log.address)) return;
-
-  // har pool ka "launch" ek hi baar bhejo (new pool / pehli liquidity add)
-  const launchKey = `launch:${key}`;
-  if (seenPools.has(launchKey)) return;
-  seenPools.add(launchKey);
-
-  const label = await poolTokenLabel(log.address);
-  const head = label ? `\nToken: ${label}` : "";
-
-  // checklist update: launching = true
-  markStatus(log.address, "launching");
-
-  await send(
-    `🚀 *LAUNCHING* — liquidity added${head}\n\n` +
-    `Pool/Pair: \`${log.address}\`\n` +
-    `[Tx](${EXPLORER}/tx/${log.transactionHash}) · [Contract](${EXPLORER}/address/${log.address})`
-  );
+// ---------- the unified card ----------
+// Every alert (new token / launching / lock / burn / noxa) uses this format.
+function card({ header, addr, s, pairLabel, extras = [], txHash }) {
+  const lines = [header, ""];
+  lines.push(`Name: *${s.name}*`);
+  lines.push(`Ticker: *${s.symbol}*`);
+  if (s.supplyStr) lines.push(`Supply: ${s.supplyStr}`);
+  if (pairLabel) lines.push(`Pair: ${pairLabel}`);
+  for (const ex of extras) lines.push(ex);
+  lines.push("", statusChecklist(addr), "");
+  lines.push(`CA: \`${addr}\``);
+  if (s.deployer) lines.push(`Deployer: \`${s.deployer}\``);
+  const links = [
+    txHash ? `[Tx](${EXPLORER}/tx/${txHash})` : null,
+    `[Contract](${EXPLORER}/address/${addr})`,
+    `[Holders](${EXPLORER}/token/${addr}?tab=holders)`,
+    s.noxa ? `[Trade](https://fun.noxa.fi/robinhood)` : null,
+  ].filter(Boolean).join(" · ");
+  lines.push(links);
+  return lines.join("\n");
 }
 
-// pool ke token0/token1 me se jo humara tracked token hai, uska status update karo
-async function markStatus(poolAddr, field) {
+// one card per token per stage
+const sentCards = new Set();
+function once(stage, addr) {
+  const k = `${stage}:${addr.toLowerCase()}`;
+  if (sentCards.has(k)) return false;
+  sentCards.add(k);
+  return true;
+}
+// one launch per pool
+const seenPools = new Set();
+
+// ---------- pool helpers ----------
+// Returns { mainAddr, pairLabel } for the non-base token in a pool, or null.
+async function poolMainToken(poolAddr) {
   try {
     const pool = new ethers.Contract(poolAddr, POOL_ABI, provider);
     const [t0, t1] = await Promise.all([pool.token0(), pool.token1()]);
-    for (const a of [t0.toLowerCase(), t1.toLowerCase()]) {
-      const s = tokenStatus.get(a);
-      if (s) { s[field] = true; }
-    }
-  } catch { /* pool nahi mila to chhodo */ }
+    const [a, b] = await Promise.all([readToken(t0), readToken(t1)]);
+    let mainAddr, mainInfo, otherInfo;
+    if (a.isToken && !BASE_SYMBOLS.test(a.symbol)) { mainAddr = t0; mainInfo = a; otherInfo = b; }
+    else if (b.isToken && !BASE_SYMBOLS.test(b.symbol)) { mainAddr = t1; mainInfo = b; otherInfo = a; }
+    else return null; // both base tokens or unreadable — not interesting
+    const pairLabel = otherInfo.isToken
+      ? `${mainInfo.symbol} / ${otherInfo.symbol}`
+      : mainInfo.symbol;
+    return { mainAddr, pairLabel };
+  } catch {
+    return null;
+  }
 }
 
+function poolIsNoxa(poolAddr, mainAddr) {
+  return noxaAddrs.has(poolAddr.toLowerCase()) ||
+         (mainAddr && noxaAddrs.has(mainAddr.toLowerCase()));
+}
+
+// ---------- notifiers ----------
+
+// NOXA Fun launch (factory event) — token + pool + locked LP, all in one tx
+async function notifyNoxaLaunch(log) {
+  let ev;
+  try {
+    ev = NOXA_IFACE.parseLog({ topics: log.topics, data: log.data });
+  } catch (e) {
+    console.error("noxa decode failed:", e.message);
+    return;
+  }
+  const token = ev.args.token;
+  const pool = ev.args.pool;
+
+  // always register, even when muted, so generic alerts stay quiet about noxa
+  noxaAddrs.add(token.toLowerCase());
+  noxaAddrs.add(pool.toLowerCase());
+  seenPools.add(`launch:${pool.toLowerCase()}`);
+
+  if (EXCLUDE_NOXA) return;
+  if (!once("noxa", token)) return;
+
+  // NOXA tokens: deployed + instantly trading on V3 + LP locked forever in locker
+  const s = await getStatus(token, {
+    deployer: ev.args.deployer,
+    pool,
+    deployed: true,
+    launching: true,
+    lp: true,
+    noxa: true,
+  });
+
+  let pairLabel = null;
+  try {
+    const pairInfo = await readToken(ev.args.pairToken);
+    if (pairInfo.isToken) pairLabel = `${s.symbol} / ${pairInfo.symbol}`;
+  } catch { /* koi baat nahi */ }
+
+  const tag = classify(s.name, s.symbol);
+  await send(card({
+    header: `🟢 *NOXA FUN LAUNCH* (${tag})`,
+    addr: token,
+    s,
+    pairLabel,
+    extras: [`Initial buy: ${ethers.formatEther(ev.args.initialBuyAmount)} ETH`],
+    txHash: log.transactionHash,
+  }));
+}
+
+// Direct contract deployment (someone deploys their own token)
+async function notifyDeploy(tx, receipt) {
+  const addr = receipt.contractAddress;
+
+  // rare: direct deploy that touches noxa infra
+  if (isNoxaTx(receipt)) {
+    noxaAddrs.add(addr.toLowerCase());
+    if (EXCLUDE_NOXA) return;
+  }
+
+  const s = await getStatus(addr, { deployer: tx.from, deployed: true });
+  if (!s.isToken) return; // not an ERC20 — skip
+  if (!once("deploy", addr)) return;
+
+  const tag = classify(s.name, s.symbol);
+  await send(card({
+    header: `🆕 *NEW TOKEN* (${tag})`,
+    addr,
+    s,
+    txHash: tx.hash,
+  }));
+}
+
+// First liquidity / new pool for a token
+async function notifyLiquidity(log) {
+  const poolKey = log.address.toLowerCase();
+  const launchKey = `launch:${poolKey}`;
+  if (seenPools.has(launchKey)) return;
+
+  const m = await poolMainToken(log.address);
+  if (!m) { seenPools.add(launchKey); return; } // unreadable pool — skip silently
+
+  if (poolIsNoxa(log.address, m.mainAddr)) { seenPools.add(launchKey); return; }
+
+  seenPools.add(launchKey);
+  const s = await getStatus(m.mainAddr, { launching: true, pool: log.address });
+  if (!once("launching", m.mainAddr)) return;
+
+  const tag = classify(s.name, s.symbol);
+  await send(card({
+    header: `🚀 *LAUNCHING* (${tag})`,
+    addr: m.mainAddr,
+    s,
+    pairLabel: m.pairLabel,
+    txHash: log.transactionHash,
+  }));
+}
+
+// LP tokens sent to dead address (burn) or a known locker (lock)
 async function notifyBurnLock(log, kind) {
   const key = log.address.toLowerCase();
-  // noxa pool hai to skip
-  if (noxaAddrs.has(key) || await poolIsNoxa(log.address)) return;
-  // dobara same LP na bheje
-  const dkey = `${kind}:${key}`;
-  if (seenPools.has(dkey)) return;
+  if (seenPools.has(`${kind}:${key}`)) return;
 
-  // 0-amount (dust) transfers skip karo
+  // 0-amount dust transfers skip
   try {
-    const amount = BigInt(log.data);
-    if (amount === 0n) return;
-  } catch { /* data padha nahi gaya to aage badho */ }
+    if (BigInt(log.data) === 0n) return;
+  } catch { /* continue */ }
 
-  // sirf tab bolo "liquidity" jab ye sach me pool/LP token ho
-  const label = await poolTokenLabel(log.address);
-  if (!label) return; // pool nahi hai = normal token burn, ignore
+  const m = await poolMainToken(log.address);
+  if (!m) return; // not an LP token — normal token burn, ignore
+  if (poolIsNoxa(log.address, m.mainAddr)) return;
 
-  seenPools.add(dkey);
-  markStatus(log.address, "lp"); // checklist: LP locked/burned = true
-  const emoji = kind === "burnt" ? "🔥" : "🔒";
-  await send(
-    `${emoji} *LIQUIDITY ${kind.toUpperCase()}*\nToken: ${label}\n\n` +
-    `LP token: \`${log.address}\`\n` +
-    `[Tx](${EXPLORER}/tx/${log.transactionHash}) · [Contract](${EXPLORER}/address/${log.address})`
-  );
+  seenPools.add(`${kind}:${key}`);
+  const s = await getStatus(m.mainAddr, { lp: true, launching: true });
+  if (!once(`lp:${kind}`, m.mainAddr)) return;
+
+  const header = kind === "burnt"
+    ? `🔥 *LIQUIDITY BURNED*`
+    : `🔒 *LIQUIDITY LOCKED*`;
+  await send(card({
+    header,
+    addr: m.mainAddr,
+    s,
+    pairLabel: m.pairLabel,
+    extras: [`LP token: \`${log.address}\``],
+    txHash: log.transactionHash,
+  }));
 }
 
 // ---------- block scanner ----------
@@ -294,7 +381,20 @@ async function scanBlock(blockNumber) {
   const block = await provider.getBlock(blockNumber, true);
   if (!block) return;
 
-  // 1) contract deployments
+  // 0) NOXA launches first — registers noxa pools before liquidity scanning
+  try {
+    const noxaLogs = await provider.getLogs({
+      fromBlock: blockNumber,
+      toBlock: blockNumber,
+      address: NOXA_FACTORY,
+      topics: [TOKEN_LAUNCHED_TOPIC],
+    });
+    for (const log of noxaLogs) await notifyNoxaLaunch(log);
+  } catch (e) {
+    console.error("noxa log scan error:", e.message);
+  }
+
+  // 1) direct contract deployments
   for (const tx of block.prefetchedTransactions) {
     if (tx.to === null) {
       const receipt = await provider.getTransactionReceipt(tx.hash);
@@ -304,7 +404,7 @@ async function scanBlock(blockNumber) {
     }
   }
 
-  // 2) liquidity events + burn/lock (Transfer of LP to dead/locker)
+  // 2) liquidity events + burn/lock
   const logs = await provider.getLogs({
     fromBlock: blockNumber,
     toBlock: blockNumber,
@@ -312,11 +412,10 @@ async function scanBlock(blockNumber) {
   });
   for (const log of logs) {
     const t = log.topics[0];
-    if (t === TOPICS.V2_MINT) await notifyLiquidity(log, "V2 add");
-    else if (t === TOPICS.V3_MINT) await notifyLiquidity(log, "V3 add");
-    else if (t === TOPICS.PAIR_CREATED) await notifyLiquidity(log, "new pair");
-    else if (t === TOPICS.POOL_CREATED) await notifyLiquidity(log, "new pool");
-    else if (t === TOPICS.TRANSFER && log.topics.length === 3) {
+    if (t === TOPICS.V2_MINT || t === TOPICS.V3_MINT ||
+        t === TOPICS.PAIR_CREATED || t === TOPICS.POOL_CREATED) {
+      await notifyLiquidity(log);
+    } else if (t === TOPICS.TRANSFER && log.topics.length === 3) {
       const to = topicAddr(log.topics[2]);
       if (DEAD_ADDRS.has(to)) await notifyBurnLock(log, "burnt");
       else if (LOCKER_ADDRS.has(to)) await notifyBurnLock(log, "locked");
@@ -328,11 +427,12 @@ async function scanBlock(blockNumber) {
 async function main() {
   let last = await provider.getBlockNumber();
   console.log(`Watching ${RPC} from block ${last}`);
-  await send(`✅ Robinhood Chain watcher online. Starting at block ${last}.`);
+  console.log(`NOXA factory: ${NOXA_FACTORY} (alerts ${EXCLUDE_NOXA ? "MUTED" : "ON"})`);
+  await send(`✅ Robinhood Chain watcher online. Starting at block ${last}. NOXA alerts: ${EXCLUDE_NOXA ? "off" : "on"}.`);
 
   let busy = false;
   setInterval(async () => {
-    if (busy) return;          // avoid overlapping polls
+    if (busy) return;
     busy = true;
     try {
       const head = await provider.getBlockNumber();
