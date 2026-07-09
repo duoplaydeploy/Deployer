@@ -129,6 +129,44 @@ async function ownershipState(addr) {
   return { state: "unknown", owner: null }; // no standard owner() — can't tell
 }
 
+// ---------- buy/sell tax check (self-reported by the contract) ----------
+// Standard tax-token templates expose their fees via public getters. We try the
+// common naming families. IMPORTANT: these values are what the contract CLAIMS —
+// a malicious custom contract can lie. Renounced = values frozen; owned = mutable.
+const TAX_GETTER_PAIRS = [
+  ["buyTax", "sellTax"],
+  ["_buyTax", "_sellTax"],
+  ["buyTotalFees", "sellTotalFees"],
+  ["totalBuyTax", "totalSellTax"],
+  ["buyFee", "sellFee"],
+  ["buyFees", "sellFees"],
+  ["taxBuy", "taxSell"],
+];
+const TAX_ABI = TAX_GETTER_PAIRS.flat().map(
+  (n) => `function ${n}() view returns (uint256)`
+);
+
+function normTax(v) {
+  let n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return null;
+  if (n > 100) n = n / 100; // looks like basis points (300 = 3%)
+  if (n > 100) return 100;  // still absurd — cap for display
+  return Math.round(n * 10) / 10;
+}
+
+async function taxState(addr) {
+  const c = new ethers.Contract(addr, TAX_ABI, provider);
+  for (const [b, sl] of TAX_GETTER_PAIRS) {
+    try {
+      const [bv, sv] = await Promise.all([c[b](), c[sl]()]);
+      const buy = normTax(bv);
+      const sell = normTax(sv);
+      if (buy !== null && sell !== null) return { known: true, buy, sell };
+    } catch { /* this naming family doesn't exist — try the next */ }
+  }
+  return { known: false, buy: null, sell: null };
+}
+
 async function readToken(addr) {
   const c = new ethers.Contract(addr, ERC20_ABI, provider);
   try {
@@ -203,12 +241,16 @@ async function getStatus(addr, patch = {}) {
       deployer: null, pool: null, noxa: false,
       deployed: true, verify: "none", launching: false, lp: false,
       renounce: "unknown", ownerAddr: null,
+      tax: { known: false, buy: null, sell: null },
       // card state
       header: "🆕 *NEW TOKEN*",
       pairLabel: null, txHash: null, extraLines: [],
       dex: { live: false, url: null, links: [], liq: null, mc: null },
     };
     tokenStatus.set(key, s);
+    // contract code is immutable: if tax getters don't exist now, they never will,
+    // so the full getter scan runs exactly once per token
+    if (s.isToken) s.tax = await taxState(addr);
   }
   // re-check verification + ownership on every new stage — both often change
   // shortly after deploy (devs verify, then renounce)
@@ -217,6 +259,10 @@ async function getStatus(addr, patch = {}) {
     const o = await ownershipState(addr);
     s.renounce = o.state;
     s.ownerAddr = o.owner;
+  }
+  // tax VALUES stay mutable while the owner holds the keys — refresh them
+  if (s.isToken && s.tax.known && s.renounce !== "renounced") {
+    s.tax = await taxState(addr);
   }
   Object.assign(s, patch);
   return s;
@@ -260,6 +306,14 @@ function buildCard(addr) {
   lines.push(`Ticker: *${s.symbol}*`);
   if (s.supplyStr) lines.push(`Supply: ${s.supplyStr}`);
   if (s.pairLabel) lines.push(`Pair: ${s.pairLabel}`);
+  if (s.tax?.known) {
+    const worst = Math.max(s.tax.buy, s.tax.sell);
+    const mark = worst >= 30 ? " 🚨" : worst > 10 ? " ⚠️" : "";
+    const frozen = s.renounce === "renounced" ? "" : " _(owner can change)_";
+    lines.push(`Tax: Buy ${s.tax.buy}% / Sell ${s.tax.sell}%${mark}${frozen}`);
+  } else if (s.isToken) {
+    lines.push(`Tax: none declared`);
+  }
   for (const ex of s.extraLines) lines.push(ex);
   lines.push("", statusChecklist(addr), "");
   if (s.dex.links.length) lines.push(`Links: ${s.dex.links.join(" · ")}`, "");
