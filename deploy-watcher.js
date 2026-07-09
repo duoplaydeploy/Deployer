@@ -138,19 +138,20 @@ function topicAddr(topic) {
 }
 
 // ---------- telegram send (with retry) ----------
-async function send(text) {
+async function send(text, opts = {}) {
   for (let i = 0; i < 3; i++) {
     try {
-      await bot.sendMessage(TG_CHAT, text, {
+      return await bot.sendMessage(TG_CHAT, text, {
         parse_mode: "Markdown",
         disable_web_page_preview: true,
+        ...opts,
       });
-      return;
     } catch (e) {
       if (i === 2) console.error("tg send failed:", e.message);
       else await new Promise((r) => setTimeout(r, 1000 * (i + 1)));
     }
   }
+  return null;
 }
 
 function fmtSupply(supply, decimals) {
@@ -158,9 +159,9 @@ function fmtSupply(supply, decimals) {
   return human.toLocaleString("en-US", { maximumFractionDigits: 0 });
 }
 
-// ---------- per-token status (for the ✅/❌ checklist) ----------
-// addr(lower) -> { name, symbol, supplyStr, deployer, pool,
-//                  deployed, verified, launching, lp, isToken, noxa }
+// ---------- per-token status (one evolving card per token) ----------
+// addr(lower) -> everything we know about a token, including its Telegram
+// card message id so later events EDIT the same card instead of new messages.
 const tokenStatus = new Map();
 
 async function getStatus(addr, patch = {}) {
@@ -175,6 +176,10 @@ async function getStatus(addr, patch = {}) {
       isToken: info.isToken,
       deployer: null, pool: null, noxa: false,
       deployed: true, verify: "none", launching: false, lp: false,
+      // card state
+      header: "🆕 *NEW TOKEN*",
+      pairLabel: null, txHash: null, extraLines: [],
+      dex: { live: false, url: null, links: [], liq: null, mc: null },
     };
     tokenStatus.set(key, s);
   }
@@ -186,43 +191,61 @@ async function getStatus(addr, patch = {}) {
 
 function statusChecklist(addr) {
   const s = tokenStatus.get(addr.toLowerCase()) || {};
+  const d = s.dex || {};
   const row = (icon, n, title, sub) =>
     `${icon} *#${n} ${title}*\n     _${sub}_`;
   const [vIcon, vSub] =
     s.verify === "verified" ? ["✅", "Code human-readable on explorer"] :
     s.verify === "similar"  ? ["⚠️", "Unverified — bytecode matches a verified contract"] :
                               ["❌", "Code human-readable on explorer"];
+  const dexSub = d.live
+    ? ([d.liq ? `Liquidity ${d.liq}` : null, d.mc ? `MC ${d.mc}` : null]
+        .filter(Boolean).join(" · ") || "Indexed and trading")
+    : "Indexed on dexscreener.com";
   return [
     row(s.deployed ? "✅" : "❌", 1, "CONTRACT DEPLOYED", "Smart contract on-chain"),
     row(vIcon, 2, "CONTRACT VERIFIED", vSub),
     row(s.launching ? "✅" : "❌", 3, "LAUNCHING", "Pair created — live or about to be"),
     row(s.lp ? "✅" : "❌", 4, "LIQUIDITY LOCKED / BURNED", "LP locked via third party or burned"),
+    row(d.live ? "✅" : "❌", 5, "LIVE ON DEXSCREENER", dexSub),
+    row(d.links?.length ? "✅" : "❌", 6, "DEX INFO UPDATED", "Website & socials on DexScreener"),
   ].join("\n");
 }
 
-// ---------- the unified card ----------
-// Every alert (new token / launching / lock / burn / noxa) uses this format.
-function card({ header, addr, s, pairLabel, extras = [], txHash }) {
-  const lines = [header, ""];
+// ---------- the evolving card ----------
+// Built entirely from tokenStatus, so it can be re-rendered after any change.
+function buildCard(addr) {
+  const s = tokenStatus.get(addr.toLowerCase());
+  if (!s) return null;
+  const lines = [s.header, ""];
   lines.push(`Name: *${s.name}*`);
   lines.push(`Ticker: *${s.symbol}*`);
   if (s.supplyStr) lines.push(`Supply: ${s.supplyStr}`);
-  if (pairLabel) lines.push(`Pair: ${pairLabel}`);
-  for (const ex of extras) lines.push(ex);
+  if (s.pairLabel) lines.push(`Pair: ${s.pairLabel}`);
+  for (const ex of s.extraLines) lines.push(ex);
   lines.push("", statusChecklist(addr), "");
+  if (s.dex.links.length) lines.push(`Links: ${s.dex.links.join(" · ")}`, "");
   lines.push(`CA: \`${addr}\``);
   if (s.deployer) lines.push(`Deployer: \`${s.deployer}\``);
   const links = [
-    txHash ? `[Tx](${EXPLORER}/tx/${txHash})` : null,
+    s.txHash ? `[Tx](${EXPLORER}/tx/${s.txHash})` : null,
     `[Contract](${EXPLORER}/address/${addr})`,
     `[Holders](${EXPLORER}/token/${addr}?tab=holders)`,
+    s.dex.url ? `[DexScreener](${s.dex.url})` : null,
     s.noxa ? `[Trade](https://fun.noxa.fi/robinhood)` : null,
   ].filter(Boolean).join(" · ");
   lines.push(links);
   return lines.join("\n");
 }
 
-// one card per token per stage
+// post a fresh, complete card reflecting the token's CURRENT state.
+// Every event sends a new card — the newest card is always the full picture.
+async function sendCard(addr) {
+  const text = buildCard(addr);
+  if (text) await send(text);
+}
+
+// one alert per token per stage
 const sentCards = new Set();
 function once(stage, addr) {
   const k = `${stage}:${addr.toLowerCase()}`;
@@ -307,23 +330,18 @@ async function notifyNoxaLaunch(log) {
     launching: true,
     lp: true,
     noxa: true,
+    txHash: log.transactionHash,
   });
 
-  let pairLabel = null;
   try {
     const pairInfo = await readToken(ev.args.pairToken);
-    if (pairInfo.isToken) pairLabel = `${s.symbol} / ${pairInfo.symbol}`;
+    if (pairInfo.isToken) s.pairLabel = `${s.symbol} / ${pairInfo.symbol}`;
   } catch { /* koi baat nahi */ }
 
-  const tag = classify(s.name, s.symbol);
-  await send(card({
-    header: `🟢 *NOXA FUN LAUNCH* (${tag})`,
-    addr: token,
-    s,
-    pairLabel,
-    extras: [`Initial buy: ${ethers.formatEther(ev.args.initialBuyAmount)} ETH`],
-    txHash: log.transactionHash,
-  }));
+  const buyLine = `Initial buy: ${ethers.formatEther(ev.args.initialBuyAmount)} ETH`;
+  if (!s.extraLines.includes(buyLine)) s.extraLines.push(buyLine);
+  s.header = `🟢 *NOXA FUN LAUNCH* (${classify(s.name, s.symbol)})`;
+  await sendCard(token);
 }
 
 // Direct contract deployment (someone deploys their own token)
@@ -336,17 +354,12 @@ async function notifyDeploy(tx, receipt) {
     if (EXCLUDE_NOXA) return;
   }
 
-  const s = await getStatus(addr, { deployer: tx.from, deployed: true });
+  const s = await getStatus(addr, { deployer: tx.from, deployed: true, txHash: tx.hash });
   if (!s.isToken) return; // not an ERC20 — skip
   if (!once("deploy", addr)) return;
 
-  const tag = classify(s.name, s.symbol);
-  await send(card({
-    header: `🆕 *NEW TOKEN* (${tag})`,
-    addr,
-    s,
-    txHash: tx.hash,
-  }));
+  s.header = `🆕 *NEW TOKEN* (${classify(s.name, s.symbol)})`;
+  await sendCard(addr);
   watchOnDexScreener(addr);
 }
 
@@ -365,17 +378,16 @@ async function notifyLiquidity(log) {
   if (poolIsNoxa(log.address, m.mainAddr)) { seenPools.add(launchKey); return; }
 
   seenPools.add(launchKey);
-  const s = await getStatus(m.mainAddr, { launching: true, pool: log.address });
+  const s = await getStatus(m.mainAddr, {
+    launching: true,
+    pool: log.address,
+    pairLabel: m.pairLabel,
+  });
+  if (!s.txHash) s.txHash = log.transactionHash;
   if (!once("launching", m.mainAddr)) return;
 
-  const tag = classify(s.name, s.symbol);
-  await send(card({
-    header: `🚀 *LAUNCHING* (${tag})`,
-    addr: m.mainAddr,
-    s,
-    pairLabel: m.pairLabel,
-    txHash: log.transactionHash,
-  }));
+  s.header = `🚀 *LAUNCHING* (${classify(s.name, s.symbol)})`;
+  await sendCard(m.mainAddr);
   watchOnDexScreener(m.mainAddr);
 }
 
@@ -396,20 +408,19 @@ async function notifyBurnLock(log, kind) {
   if (poolIsNoxa(log.address, m.mainAddr)) return;
 
   seenPools.add(`${kind}:${key}`);
-  const s = await getStatus(m.mainAddr, { lp: true, launching: true });
+  const s = await getStatus(m.mainAddr, {
+    lp: true,
+    launching: true,
+    pairLabel: m.pairLabel,
+  });
   if (!once(`lp:${kind}`, m.mainAddr)) return;
 
-  const header = kind === "burnt"
-    ? `🔥 *LIQUIDITY BURNED*`
-    : `🔒 *LIQUIDITY LOCKED*`;
-  await send(card({
-    header,
-    addr: m.mainAddr,
-    s,
-    pairLabel: m.pairLabel,
-    extras: [`LP token: \`${log.address}\``],
-    txHash: log.transactionHash,
-  }));
+  const lpLine = `LP token: \`${log.address}\``;
+  if (!s.extraLines.includes(lpLine)) s.extraLines.push(lpLine);
+
+  const emoji = kind === "burnt" ? "🔥" : "🔒";
+  s.header = `${emoji} *LIQUIDITY ${kind === "burnt" ? "BURNED" : "LOCKED"}* — *${s.symbol}*`;
+  await sendCard(m.mainAddr);
   watchOnDexScreener(m.mainAddr);
 }
 
@@ -479,27 +490,26 @@ async function pollDexScreener() {
     for (const [token, p] of best) {
       const w = dexWatch.get(token);
       const s = tokenStatus.get(token);
-      const nm = s ? `*${s.name}* (${s.symbol})` : `\`${token}\``;
+      if (!s) continue; // watched tokens always have status, but be safe
       const dsUrl = p.url || `https://dexscreener.com/${DEX_CHAIN_ID}/${p.pairAddress}`;
 
-      // (1) first time this token shows up on DexScreener
+      // (1) first time this token shows up on DexScreener → flip #5 on its card
       if (!w.live) {
         w.live = true;
-        if (s) s.launching = true; // also backfills launches missed during downtime
-        const stats = [
-          p.liquidity?.usd ? `Liquidity: ${fmtUsd(p.liquidity.usd)}` : null,
-          p.fdv ? `MC: ${fmtUsd(p.fdv)}` : null,
-        ].filter(Boolean).join(" · ");
-        await send(
-          `📈 *LIVE ON DEXSCREENER*\n` +
-          `Token: ${nm} — ${p.baseToken.symbol} / ${p.quoteToken?.symbol || "?"}` +
-          (stats ? `\n${stats}` : "") + `\n\n` +
-          `CA: \`${token}\`\n` +
-          `[DexScreener](${dsUrl}) · [Contract](${EXPLORER}/address/${token})`
-        );
+        s.launching = true; // also backfills launches missed during downtime
+        s.dex.live = true;
+        s.dex.url = dsUrl;
+        s.dex.liq = p.liquidity?.usd ? fmtUsd(p.liquidity.usd) : null;
+        s.dex.mc = p.fdv ? fmtUsd(p.fdv) : null;
+        if (!s.pairLabel && p.quoteToken?.symbol) {
+          s.pairLabel = `${p.baseToken.symbol} / ${p.quoteToken.symbol}`;
+        }
+        s.header = `📈 *LIVE ON DEXSCREENER* — *${s.symbol}*`;
+        await sendCard(token);
       }
 
       // (2) profile links appeared or changed (usually = dev paid for token info)
+      //     → flip #6 on the card, show links on the card, ping with the links
       const links = [];
       for (const ws of p.info?.websites || []) {
         if (ws?.url) links.push(`[${linkLabel(ws.label || "website")}](${ws.url})`);
@@ -511,13 +521,10 @@ async function pollDexScreener() {
       if (keyNow && keyNow !== w.socialsKey) {
         const first = !w.socialsKey;
         w.socialsKey = keyNow;
-        await send(
-          `📣 *DEXSCREENER ${first ? "UPDATED" : "LINKS CHANGED"}* 🔥\n` +
-          `Token: ${nm}\n\n` +
-          links.join("\n") + `\n\n` +
-          `CA: \`${token}\`\n` +
-          `[DexScreener](${dsUrl}) · [Contract](${EXPLORER}/address/${token})`
-        );
+        s.dex.links = links;
+        s.dex.url = dsUrl;
+        s.header = `📣 *DEXSCREENER ${first ? "UPDATED" : "LINKS CHANGED"}* 🔥 — *${s.symbol}*`;
+        await sendCard(token);
       }
     }
   }
