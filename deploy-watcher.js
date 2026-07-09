@@ -88,14 +88,19 @@ function classify(name, symbol) {
 }
 
 // ---------- Blockscout verification check ----------
-async function isVerified(addr) {
+// Returns "verified" | "similar" | "none".
+// "similar" = contract itself is NOT verified, but Blockscout found a verified
+// contract with identical bytecode (source shown on explorer is borrowed).
+async function verifyState(addr) {
   try {
     const res = await fetch(`${EXPLORER}/api/v2/smart-contracts/${addr}`);
-    if (!res.ok) return false;
+    if (!res.ok) return "none";
     const j = await res.json();
-    return Boolean(j.is_verified || j.name);
+    if (j.is_verified || j.is_fully_verified || j.is_partially_verified) return "verified";
+    if (j.name || j.source_code) return "similar"; // bytecode match from Blockscout DB
+    return "none";
   } catch {
-    return false;
+    return "none";
   }
 }
 
@@ -169,24 +174,29 @@ async function getStatus(addr, patch = {}) {
       supplyStr: info.isToken ? fmtSupply(info.supply, info.decimals) : null,
       isToken: info.isToken,
       deployer: null, pool: null, noxa: false,
-      deployed: true, verified: false, launching: false, lp: false,
+      deployed: true, verify: "none", launching: false, lp: false,
     };
-    s.verified = await isVerified(addr);
     tokenStatus.set(key, s);
   }
+  // re-check verification on every new stage — devs often verify shortly after deploy
+  if (s.verify !== "verified") s.verify = await verifyState(addr);
   Object.assign(s, patch);
   return s;
 }
 
 function statusChecklist(addr) {
   const s = tokenStatus.get(addr.toLowerCase()) || {};
-  const row = (ok, n, title, sub) =>
-    `${ok ? "✅" : "❌"} *#${n} ${title}*\n     _${sub}_`;
+  const row = (icon, n, title, sub) =>
+    `${icon} *#${n} ${title}*\n     _${sub}_`;
+  const [vIcon, vSub] =
+    s.verify === "verified" ? ["✅", "Code human-readable on explorer"] :
+    s.verify === "similar"  ? ["⚠️", "Unverified — bytecode matches a verified contract"] :
+                              ["❌", "Code human-readable on explorer"];
   return [
-    row(s.deployed, 1, "CONTRACT DEPLOYED", "Smart contract on-chain"),
-    row(s.verified, 2, "CONTRACT VERIFIED", "Code human-readable on explorer"),
-    row(s.launching, 3, "LAUNCHING", "Pair created — live or about to be"),
-    row(s.lp, 4, "LIQUIDITY LOCKED / BURNED", "LP locked via third party or burned"),
+    row(s.deployed ? "✅" : "❌", 1, "CONTRACT DEPLOYED", "Smart contract on-chain"),
+    row(vIcon, 2, "CONTRACT VERIFIED", vSub),
+    row(s.launching ? "✅" : "❌", 3, "LAUNCHING", "Pair created — live or about to be"),
+    row(s.lp ? "✅" : "❌", 4, "LIQUIDITY LOCKED / BURNED", "LP locked via third party or burned"),
   ].join("\n");
 }
 
@@ -337,6 +347,7 @@ async function notifyDeploy(tx, receipt) {
     s,
     txHash: tx.hash,
   }));
+  watchOnDexScreener(addr);
 }
 
 // First liquidity / new pool for a token
@@ -365,6 +376,7 @@ async function notifyLiquidity(log) {
     pairLabel: m.pairLabel,
     txHash: log.transactionHash,
   }));
+  watchOnDexScreener(m.mainAddr);
 }
 
 // LP tokens sent to dead address (burn) or a known locker (lock)
@@ -398,18 +410,138 @@ async function notifyBurnLock(log, kind) {
     extras: [`LP token: \`${log.address}\``],
     txHash: log.transactionHash,
   }));
+  watchOnDexScreener(m.mainAddr);
 }
 
-// ---------- block scanner ----------
-async function scanBlock(blockNumber) {
-  const block = await provider.getBlock(blockNumber, true);
-  if (!block) return;
+// ---------- DexScreener watcher ----------
+// Every token we card gets watched on DexScreener for DEX_WATCH_HOURS.
+// Sends: "LIVE ON DEXSCREENER" the first time it appears there, and
+// "DEXSCREENER UPDATED" when its profile links (website/X/Telegram) appear or change.
+const DEX_CHAIN_ID = process.env.DEX_CHAIN_ID || "robinhood";
+const DEX_POLL_MS = Number(process.env.DEX_POLL_MS || 60000);   // poll once a minute
+const DEX_WATCH_HOURS = Number(process.env.DEX_WATCH_HOURS || 24);
+const DEX_WATCH_MAX = 300; // cap = 10 batched API calls/min max, well under rate limits
 
-  // 0) NOXA launches first — registers noxa pools before liquidity scanning
+// token(lower) -> { addedAt, live, socialsKey }
+const dexWatch = new Map();
+
+function watchOnDexScreener(addr) {
+  const key = addr.toLowerCase();
+  if (dexWatch.has(key) || dexWatch.size >= DEX_WATCH_MAX) return;
+  dexWatch.set(key, { addedAt: Date.now(), live: false, socialsKey: "" });
+}
+
+function linkLabel(type) {
+  const t = (type || "").toLowerCase();
+  if (t === "twitter" || t === "x") return "𝕏 Twitter";
+  if (t === "telegram") return "✈️ Telegram";
+  if (t === "discord") return "💬 Discord";
+  if (t.includes("website") || t === "") return "🌐 Website";
+  return `🔗 ${type[0].toUpperCase() + type.slice(1)}`;
+}
+
+function fmtUsd(n) {
+  return "$" + Math.round(n).toLocaleString("en-US");
+}
+
+async function pollDexScreener() {
+  // drop tokens past the watch window
+  const cutoff = Date.now() - DEX_WATCH_HOURS * 3600 * 1000;
+  for (const [k, v] of dexWatch) if (v.addedAt < cutoff) dexWatch.delete(k);
+  if (dexWatch.size === 0) return;
+
+  const addrs = [...dexWatch.keys()];
+  for (let i = 0; i < addrs.length; i += 30) {
+    const batch = addrs.slice(i, i + 30);
+    let pairs = [];
+    try {
+      const res = await fetch(
+        `https://api.dexscreener.com/latest/dex/tokens/${batch.join(",")}`
+      );
+      if (!res.ok) continue;
+      const j = await res.json();
+      pairs = j.pairs || [];
+    } catch (e) {
+      console.error("dexscreener poll error:", e.message);
+      continue;
+    }
+
+    // keep each watched token's best (highest-liquidity) pair on our chain
+    const best = new Map();
+    for (const p of pairs) {
+      if (p.chainId !== DEX_CHAIN_ID) continue;
+      const base = p.baseToken?.address?.toLowerCase();
+      if (!base || !dexWatch.has(base)) continue;
+      const cur = best.get(base);
+      if (!cur || (p.liquidity?.usd || 0) > (cur.liquidity?.usd || 0)) best.set(base, p);
+    }
+
+    for (const [token, p] of best) {
+      const w = dexWatch.get(token);
+      const s = tokenStatus.get(token);
+      const nm = s ? `*${s.name}* (${s.symbol})` : `\`${token}\``;
+      const dsUrl = p.url || `https://dexscreener.com/${DEX_CHAIN_ID}/${p.pairAddress}`;
+
+      // (1) first time this token shows up on DexScreener
+      if (!w.live) {
+        w.live = true;
+        if (s) s.launching = true; // also backfills launches missed during downtime
+        const stats = [
+          p.liquidity?.usd ? `Liquidity: ${fmtUsd(p.liquidity.usd)}` : null,
+          p.fdv ? `MC: ${fmtUsd(p.fdv)}` : null,
+        ].filter(Boolean).join(" · ");
+        await send(
+          `📈 *LIVE ON DEXSCREENER*\n` +
+          `Token: ${nm} — ${p.baseToken.symbol} / ${p.quoteToken?.symbol || "?"}` +
+          (stats ? `\n${stats}` : "") + `\n\n` +
+          `CA: \`${token}\`\n` +
+          `[DexScreener](${dsUrl}) · [Contract](${EXPLORER}/address/${token})`
+        );
+      }
+
+      // (2) profile links appeared or changed (usually = dev paid for token info)
+      const links = [];
+      for (const ws of p.info?.websites || []) {
+        if (ws?.url) links.push(`[${linkLabel(ws.label || "website")}](${ws.url})`);
+      }
+      for (const so of p.info?.socials || []) {
+        if (so?.url) links.push(`[${linkLabel(so.type)}](${so.url})`);
+      }
+      const keyNow = links.slice().sort().join("|");
+      if (keyNow && keyNow !== w.socialsKey) {
+        const first = !w.socialsKey;
+        w.socialsKey = keyNow;
+        await send(
+          `📣 *DEXSCREENER ${first ? "UPDATED" : "LINKS CHANGED"}* 🔥\n` +
+          `Token: ${nm}\n\n` +
+          links.join("\n") + `\n\n` +
+          `CA: \`${token}\`\n` +
+          `[DexScreener](${dsUrl}) · [Contract](${EXPLORER}/address/${token})`
+        );
+      }
+    }
+  }
+}
+
+// ---------- range scanner ----------
+// Robinhood Chain has ~100ms blocks (up to ~10/sec). Scanning block-by-block
+// with multiple RPC calls each can't keep up and gets rate-limited. Instead we
+// scan RANGES of blocks with a handful of RPC calls per range.
+const LOG_CHUNK = Number(process.env.LOG_CHUNK || 200);     // blocks per getLogs range
+const BLOCK_CHUNK = Number(process.env.BLOCK_CHUNK || 20);  // blocks fetched in parallel
+const MAX_LAG = Number(process.env.MAX_LAG || 2000);        // if further behind, skip ahead
+
+// server-side filter: only Transfer events TO dead/locker addresses
+const BURN_LOCK_TO_TOPICS = [...DEAD_ADDRS, ...LOCKER_ADDRS].map(
+  (a) => ethers.zeroPadValue(a, 32)
+);
+
+async function scanRange(from, to) {
+  // A) NOXA launches — registers noxa pools before liquidity scanning
   try {
     const noxaLogs = await provider.getLogs({
-      fromBlock: blockNumber,
-      toBlock: blockNumber,
+      fromBlock: from,
+      toBlock: to,
       address: NOXA_FACTORY,
       topics: [TOKEN_LAUNCHED_TOPIC],
     });
@@ -418,35 +550,56 @@ async function scanBlock(blockNumber) {
     console.error("noxa log scan error:", e.message);
   }
 
-  // 1) direct contract deployments
-  for (const tx of block.prefetchedTransactions) {
-    if (tx.to === null) {
-      const receipt = await provider.getTransactionReceipt(tx.hash);
-      if (receipt?.contractAddress && receipt.status === 1) {
-        await notifyDeploy(tx, receipt);
+  // B) direct contract deployments — blocks fetched in parallel batches
+  for (let n = from; n <= to; n += BLOCK_CHUNK) {
+    const end = Math.min(n + BLOCK_CHUNK - 1, to);
+    const blocks = await Promise.all(
+      Array.from({ length: end - n + 1 }, (_, i) =>
+        provider.getBlock(n + i, true).catch(() => null)
+      )
+    );
+    for (const block of blocks) {
+      if (!block) continue;
+      for (const tx of block.prefetchedTransactions) {
+        if (tx.to === null) {
+          const receipt = await provider.getTransactionReceipt(tx.hash).catch(() => null);
+          if (receipt?.contractAddress && receipt.status === 1) {
+            await notifyDeploy(tx, receipt);
+          }
+        }
       }
     }
   }
 
-  // 2) liquidity events + burn/lock
-  const logs = await provider.getLogs({
-    fromBlock: blockNumber,
-    toBlock: blockNumber,
-    topics: [[TOPICS.V2_MINT, TOPICS.V3_MINT, TOPICS.PAIR_CREATED, TOPICS.POOL_CREATED, TOPICS.TRANSFER]],
+  // C) pool creations + liquidity adds for the whole range (one call)
+  const liqLogs = await provider.getLogs({
+    fromBlock: from,
+    toBlock: to,
+    topics: [[TOPICS.V2_MINT, TOPICS.V3_MINT, TOPICS.PAIR_CREATED, TOPICS.POOL_CREATED]],
   });
-  for (const log of logs) {
+  for (const log of liqLogs) {
     const t = log.topics[0];
     if (t === TOPICS.PAIR_CREATED || t === TOPICS.POOL_CREATED) {
       // birth certificate: remember this pool as genuinely new (no alert yet)
       registerNewPool(log);
-    } else if (t === TOPICS.V2_MINT || t === TOPICS.V3_MINT) {
+    } else {
       // liquidity added: alert only if the pool was born under our watch
       await notifyLiquidity(log);
-    } else if (t === TOPICS.TRANSFER && log.topics.length === 3) {
-      const to = topicAddr(log.topics[2]);
-      if (DEAD_ADDRS.has(to)) await notifyBurnLock(log, "burnt");
-      else if (LOCKER_ADDRS.has(to)) await notifyBurnLock(log, "locked");
     }
+  }
+
+  // D) LP burns/locks: ONLY transfers to dead/locker addresses (filtered by
+  //    the RPC node itself — the general Transfer firehose never reaches us)
+  const blLogs = await provider.getLogs({
+    fromBlock: from,
+    toBlock: to,
+    topics: [TOPICS.TRANSFER, null, BURN_LOCK_TO_TOPICS],
+  });
+  for (const log of blLogs) {
+    if (log.topics.length !== 3) continue;
+    const dest = topicAddr(log.topics[2]);
+    if (DEAD_ADDRS.has(dest)) await notifyBurnLock(log, "burnt");
+    else if (LOCKER_ADDRS.has(dest)) await notifyBurnLock(log, "locked");
   }
 }
 
@@ -457,14 +610,33 @@ async function main() {
   console.log(`NOXA factory: ${NOXA_FACTORY} (alerts ${EXCLUDE_NOXA ? "MUTED" : "ON"})`);
   await send(`✅ Robinhood Chain watcher online. Starting at block ${last}. NOXA alerts: ${EXCLUDE_NOXA ? "off" : "on"}.`);
 
+  // DexScreener watcher — runs independently of the block scanner
+  setInterval(
+    () => pollDexScreener().catch((e) => console.error("dex poll error:", e.message)),
+    DEX_POLL_MS
+  );
+
   let busy = false;
   setInterval(async () => {
     if (busy) return;
     busy = true;
     try {
       const head = await provider.getBlockNumber();
-      for (let n = last + 1; n <= head; n++) await scanBlock(n);
-      last = head;
+      if (head > last) {
+        let from = last + 1;
+        // safety valve: if we've fallen absurdly far behind (RPC outage etc.),
+        // skip ahead instead of grinding through a hopeless backlog forever
+        if (head - from > MAX_LAG) {
+          console.warn(`lagging ${head - from} blocks — skipping ahead to stay live`);
+          from = head - MAX_LAG;
+        }
+        while (from <= head) {
+          const to = Math.min(from + LOG_CHUNK - 1, head);
+          await scanRange(from, to);
+          last = to; // commit progress per chunk — an error resumes HERE, not from scratch
+          from = to + 1;
+        }
+      }
     } catch (e) {
       console.error("poll error:", e.message);
     } finally {
