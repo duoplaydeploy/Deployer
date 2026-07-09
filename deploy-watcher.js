@@ -104,6 +104,31 @@ async function verifyState(addr) {
   }
 }
 
+// ---------- ownership / renounce check ----------
+// Standard Ownable tokens expose owner() (or BSC-style getOwner()).
+// owner == zero/dead address => ownership renounced, deployer can't touch it.
+const OWNABLE_ABI = [
+  "function owner() view returns (address)",
+  "function getOwner() view returns (address)",
+];
+const RENOUNCED_OWNERS = new Set([
+  "0x0000000000000000000000000000000000000000",
+  "0x000000000000000000000000000000000000dead",
+]);
+
+async function ownershipState(addr) {
+  const c = new ethers.Contract(addr, OWNABLE_ABI, provider);
+  for (const fn of ["owner", "getOwner"]) {
+    try {
+      const o = (await c[fn]()).toLowerCase();
+      return RENOUNCED_OWNERS.has(o)
+        ? { state: "renounced", owner: null }
+        : { state: "owned", owner: o };
+    } catch { /* function doesn't exist — try the next one */ }
+  }
+  return { state: "unknown", owner: null }; // no standard owner() — can't tell
+}
+
 async function readToken(addr) {
   const c = new ethers.Contract(addr, ERC20_ABI, provider);
   try {
@@ -123,6 +148,7 @@ const TOPICS = {
   PAIR_CREATED: ethers.id("PairCreated(address,address,address,uint256)"),
   POOL_CREATED: ethers.id("PoolCreated(address,address,uint24,int24,address)"),
   TRANSFER: ethers.id("Transfer(address,address,uint256)"),
+  OWNERSHIP_TRANSFERRED: ethers.id("OwnershipTransferred(address,address)"),
 };
 
 const DEAD_ADDRS = new Set([
@@ -176,6 +202,7 @@ async function getStatus(addr, patch = {}) {
       isToken: info.isToken,
       deployer: null, pool: null, noxa: false,
       deployed: true, verify: "none", launching: false, lp: false,
+      renounce: "unknown", ownerAddr: null,
       // card state
       header: "🆕 *NEW TOKEN*",
       pairLabel: null, txHash: null, extraLines: [],
@@ -183,8 +210,14 @@ async function getStatus(addr, patch = {}) {
     };
     tokenStatus.set(key, s);
   }
-  // re-check verification on every new stage — devs often verify shortly after deploy
+  // re-check verification + ownership on every new stage — both often change
+  // shortly after deploy (devs verify, then renounce)
   if (s.verify !== "verified") s.verify = await verifyState(addr);
+  if (s.isToken && s.renounce !== "renounced") {
+    const o = await ownershipState(addr);
+    s.renounce = o.state;
+    s.ownerAddr = o.owner;
+  }
   Object.assign(s, patch);
   return s;
 }
@@ -202,13 +235,18 @@ function statusChecklist(addr) {
     ? ([d.liq ? `Liquidity ${d.liq}` : null, d.mc ? `MC ${d.mc}` : null]
         .filter(Boolean).join(" · ") || "Indexed and trading")
     : "Indexed on dexscreener.com";
+  const [rIcon, rSub] =
+    s.renounce === "renounced" ? ["✅", "Deployer can no longer modify the contract"] :
+    s.renounce === "owned"     ? ["❌", `Owner can still modify: \`${(s.ownerAddr || "").slice(0, 10)}…\``] :
+                                 ["⚠️", "No standard owner() — check contract manually"];
   return [
     row(s.deployed ? "✅" : "❌", 1, "CONTRACT DEPLOYED", "Smart contract on-chain"),
     row(vIcon, 2, "CONTRACT VERIFIED", vSub),
     row(s.launching ? "✅" : "❌", 3, "LAUNCHING", "Pair created — live or about to be"),
     row(s.lp ? "✅" : "❌", 4, "LIQUIDITY LOCKED / BURNED", "LP locked via third party or burned"),
-    row(d.live ? "✅" : "❌", 5, "LIVE ON DEXSCREENER", dexSub),
-    row(d.links?.length ? "✅" : "❌", 6, "DEX INFO UPDATED", "Website & socials on DexScreener"),
+    row(rIcon, 5, "OWNERSHIP RENOUNCED", rSub),
+    row(d.live ? "✅" : "❌", 6, "LIVE ON DEXSCREENER", dexSub),
+    row(d.links?.length ? "✅" : "❌", 7, "DEX INFO UPDATED", "Website & socials on DexScreener"),
   ].join("\n");
 }
 
@@ -424,6 +462,20 @@ async function notifyBurnLock(log, kind) {
   watchOnDexScreener(m.mainAddr);
 }
 
+// Ownership renounced: OwnershipTransferred(oldOwner -> zero/dead) on a tracked token
+async function notifyRenounce(log) {
+  const token = log.address.toLowerCase();
+  const s = tokenStatus.get(token);
+  if (!s || !s.isToken) return;      // only tokens we've carded — keeps it launch-focused
+  if (noxaAddrs.has(token)) return;  // noxa stays out of the channel
+  if (!once("renounced", token)) return;
+
+  s.renounce = "renounced";
+  s.ownerAddr = null;
+  s.header = `🔑 *OWNERSHIP RENOUNCED* — *${s.symbol}*`;
+  await sendCard(log.address);
+}
+
 // ---------- DexScreener watcher ----------
 // Every token we card gets watched on DexScreener for DEX_WATCH_HOURS.
 // Sends: "LIVE ON DEXSCREENER" the first time it appears there, and
@@ -542,6 +594,10 @@ const MAX_LAG = Number(process.env.MAX_LAG || 2000);        // if further behind
 const BURN_LOCK_TO_TOPICS = [...DEAD_ADDRS, ...LOCKER_ADDRS].map(
   (a) => ethers.zeroPadValue(a, 32)
 );
+// server-side filter: only OwnershipTransferred TO zero/dead (= renounce)
+const RENOUNCE_TO_TOPICS = [...RENOUNCED_OWNERS].map(
+  (a) => ethers.zeroPadValue(a, 32)
+);
 
 async function scanRange(from, to) {
   // A) NOXA launches — registers noxa pools before liquidity scanning
@@ -608,6 +664,15 @@ async function scanRange(from, to) {
     if (DEAD_ADDRS.has(dest)) await notifyBurnLock(log, "burnt");
     else if (LOCKER_ADDRS.has(dest)) await notifyBurnLock(log, "locked");
   }
+
+  // E) ownership renounces: OwnershipTransferred(old -> zero/dead), filtered
+  //    server-side so only actual renounces reach us
+  const renLogs = await provider.getLogs({
+    fromBlock: from,
+    toBlock: to,
+    topics: [TOPICS.OWNERSHIP_TRANSFERRED, null, RENOUNCE_TO_TOPICS],
+  });
+  for (const log of renLogs) await notifyRenounce(log);
 }
 
 // ---------- main loop ----------
