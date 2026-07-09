@@ -248,6 +248,25 @@ function poolIsNoxa(poolAddr, mainAddr) {
          (mainAddr && noxaAddrs.has(mainAddr.toLowerCase()));
 }
 
+// ---------- new-pool tracking ----------
+// A pool only counts as NEW if we witnessed its creation event.
+// This stops liquidity top-ups on OLD pools from firing fake "LAUNCHING" alerts.
+const newPools = new Set();
+
+function registerNewPool(log) {
+  try {
+    let poolAddr;
+    if (log.topics[0] === TOPICS.PAIR_CREATED) {
+      // PairCreated(token0, token1, pair, uint): pair = data word 0
+      poolAddr = "0x" + log.data.slice(26, 66);
+    } else {
+      // PoolCreated(token0, token1, fee, tickSpacing, pool): pool = data word 1
+      poolAddr = "0x" + log.data.slice(90, 130);
+    }
+    newPools.add(poolAddr.toLowerCase());
+  } catch { /* malformed log — ignore */ }
+}
+
 // ---------- notifiers ----------
 
 // NOXA Fun launch (factory event) — token + pool + locked LP, all in one tx
@@ -323,6 +342,9 @@ async function notifyDeploy(tx, receipt) {
 // First liquidity / new pool for a token
 async function notifyLiquidity(log) {
   const poolKey = log.address.toLowerCase();
+  // old pool (created before we were watching) getting topped up — not a launch
+  if (!newPools.has(poolKey)) return;
+
   const launchKey = `launch:${poolKey}`;
   if (seenPools.has(launchKey)) return;
 
@@ -348,6 +370,8 @@ async function notifyLiquidity(log) {
 // LP tokens sent to dead address (burn) or a known locker (lock)
 async function notifyBurnLock(log, kind) {
   const key = log.address.toLowerCase();
+  // only for pools born under our watch — old tokens burning LP isn't our launch feed
+  if (!newPools.has(key)) return;
   if (seenPools.has(`${kind}:${key}`)) return;
 
   // 0-amount dust transfers skip
@@ -412,8 +436,11 @@ async function scanBlock(blockNumber) {
   });
   for (const log of logs) {
     const t = log.topics[0];
-    if (t === TOPICS.V2_MINT || t === TOPICS.V3_MINT ||
-        t === TOPICS.PAIR_CREATED || t === TOPICS.POOL_CREATED) {
+    if (t === TOPICS.PAIR_CREATED || t === TOPICS.POOL_CREATED) {
+      // birth certificate: remember this pool as genuinely new (no alert yet)
+      registerNewPool(log);
+    } else if (t === TOPICS.V2_MINT || t === TOPICS.V3_MINT) {
+      // liquidity added: alert only if the pool was born under our watch
       await notifyLiquidity(log);
     } else if (t === TOPICS.TRANSFER && log.topics.length === 3) {
       const to = topicAddr(log.topics[2]);
