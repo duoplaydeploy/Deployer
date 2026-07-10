@@ -10,6 +10,7 @@
 //
 const { ethers } = require("ethers");
 const TelegramBot = require("node-telegram-bot-api");
+const fs = require("fs");
 
 // ---------- config ----------
 const RPC = process.env.RPC || "https://rpc.mainnet.chain.robinhood.com";
@@ -36,6 +37,35 @@ const NOXA_FACTORY = (
 // Toggle: default true = NOXA fully hidden (it has its own platform).
 // Set EXCLUDE_NOXA=false in Railway if you ever want NOXA launch cards back.
 const EXCLUDE_NOXA = (process.env.EXCLUDE_NOXA || "true") === "true";
+
+// ---------- rug detection config + flag store ----------
+// Alert when >RUG_PCT % of a tracked pool's base-side liquidity is removed,
+// or when the token's own deployer removes ANY amount.
+const RUG_PCT = Number(process.env.RUG_PCT || 10);
+// Flags persist to this file. On Railway, attach a Volume mounted at /data and
+// set FLAGS_FILE=/data/flags.json so the rug list survives redeploys.
+const FLAGS_FILE = process.env.FLAGS_FILE || "./flags.json";
+
+let flags = { deployers: {}, tokens: {}, codeHashes: {} };
+try {
+  flags = Object.assign(flags, JSON.parse(fs.readFileSync(FLAGS_FILE, "utf8")));
+  console.log(
+    `loaded flags: ${Object.keys(flags.deployers).length} deployers, ` +
+    `${Object.keys(flags.tokens).length} tokens, ${Object.keys(flags.codeHashes).length} code hashes`
+  );
+} catch { /* no flags file yet — start clean */ }
+
+function saveFlags() {
+  try { fs.writeFileSync(FLAGS_FILE, JSON.stringify(flags, null, 2)); }
+  catch (e) { console.error("flag save failed:", e.message); }
+}
+
+function addFlag(kind, key) {
+  if (!key) return;
+  const k = key.toLowerCase();
+  flags[kind][k] = (flags[kind][k] || 0) + 1;
+  saveFlags();
+}
 
 // Factory event emitted on every NOXA launch
 // Source: https://docs.noxa.fi/integrations/launchpad/
@@ -64,6 +94,7 @@ function isNoxaTx(receipt) {
 
 // ---------- ERC20 + pool ABIs ----------
 const ERC20_ABI = [
+  "function balanceOf(address) view returns (uint256)",
   "function name() view returns (string)",
   "function symbol() view returns (string)",
   "function decimals() view returns (uint8)",
@@ -182,6 +213,8 @@ async function readToken(addr) {
 // ---------- liquidity event topics ----------
 const TOPICS = {
   V2_MINT: ethers.id("Mint(address,uint256,uint256)"),
+  V2_BURN: ethers.id("Burn(address,uint256,uint256,address)"),
+  V3_BURN: ethers.id("Burn(address,int24,int24,uint128,uint256,uint256)"),
   V3_MINT: ethers.id("Mint(address,address,int24,int24,uint128,uint256,uint256)"),
   PAIR_CREATED: ethers.id("PairCreated(address,address,address,uint256)"),
   POOL_CREATED: ethers.id("PoolCreated(address,address,uint24,int24,address)"),
@@ -242,6 +275,7 @@ async function getStatus(addr, patch = {}) {
       deployed: true, verify: "none", launching: false, lp: false,
       renounce: "unknown", ownerAddr: null,
       tax: { known: false, buy: null, sell: null },
+      rugged: false, codeHash: null,
       // card state
       header: "🆕 *NEW TOKEN*",
       pairLabel: null, txHash: null, extraLines: [],
@@ -250,7 +284,12 @@ async function getStatus(addr, patch = {}) {
     tokenStatus.set(key, s);
     // contract code is immutable: if tax getters don't exist now, they never will,
     // so the full getter scan runs exactly once per token
-    if (s.isToken) s.tax = await taxState(addr);
+    if (s.isToken) {
+      s.tax = await taxState(addr);
+      try {
+        s.codeHash = ethers.keccak256(await provider.getCode(addr)).toLowerCase();
+      } catch { /* code fetch failed — no fingerprint */ }
+    }
   }
   // re-check verification + ownership on every new stage — both often change
   // shortly after deploy (devs verify, then renounce)
@@ -299,9 +338,23 @@ function statusChecklist(addr) {
 // ---------- the evolving card ----------
 // Built entirely from tokenStatus, so it can be re-rendered after any change.
 function buildCard(addr) {
-  const s = tokenStatus.get(addr.toLowerCase());
+  const key = addr.toLowerCase();
+  const s = tokenStatus.get(key);
   if (!s) return null;
   const lines = [s.header, ""];
+  // flag warnings — shown on every card of a matching token, right up top
+  const warn = [];
+  const dep = (s.deployer || "").toLowerCase();
+  if (dep && flags.deployers[dep]) {
+    warn.push(`\u26D4 *FLAGGED DEPLOYER* \u2014 pulled liquidity ${flags.deployers[dep]}\u00d7 before`);
+  }
+  if (flags.tokens[key] && !s.rugged) {
+    warn.push(`\u26D4 *THIS TOKEN RUGGED BEFORE* \u2014 liquidity re-added`);
+  }
+  if (s.codeHash && flags.codeHashes[s.codeHash] && !s.rugged && !flags.tokens[key]) {
+    warn.push(`\u26A0\uFE0F Code matches ${flags.codeHashes[s.codeHash]} prior rug(s) \u2014 may be a shared template`);
+  }
+  if (warn.length) lines.push(...warn, "");
   lines.push(`Name: *${s.name}*`);
   lines.push(`Ticker: *${s.symbol}*`);
   if (s.supplyStr) lines.push(`Supply: ${s.supplyStr}`);
@@ -530,6 +583,75 @@ async function notifyRenounce(log) {
   await sendCard(log.address);
 }
 
+// Liquidity REMOVED from a tracked pool (pool "Burn" event = LP withdrawal).
+// Alerts when the token's deployer removes any amount, or anyone removes >RUG_PCT%.
+function dataWord(data, i) {
+  try { return BigInt("0x" + data.slice(2 + i * 64, 2 + (i + 1) * 64)); }
+  catch { return 0n; }
+}
+
+async function notifyLiqRemoval(log, ver) {
+  const poolKey = log.address.toLowerCase();
+  if (!newPools.has(poolKey)) return;           // only pools born under our watch
+  const m = await poolMainToken(log.address);
+  if (!m) return;
+  if (poolIsNoxa(log.address, m.mainAddr)) return;
+
+  // amounts: V2 Burn data = [amount0, amount1]; V3 Burn data = [liquidity, amount0, amount1]
+  const amt0 = ver === "v2" ? dataWord(log.data, 0) : dataWord(log.data, 1);
+  const amt1 = ver === "v2" ? dataWord(log.data, 1) : dataWord(log.data, 2);
+  if (amt0 === 0n && amt1 === 0n) return;       // V3 "poke" / dust — ignore
+
+  // which side is the base (WETH/USDC) — measure removal on that side
+  let baseAddr, baseRemoved;
+  try {
+    const pool = new ethers.Contract(log.address, POOL_ABI, provider);
+    const [t0, t1] = await Promise.all([pool.token0(), pool.token1()]);
+    const mainIs0 = t0.toLowerCase() === m.mainAddr.toLowerCase();
+    baseAddr = mainIs0 ? t1 : t0;
+    baseRemoved = mainIs0 ? amt1 : amt0;
+  } catch { return; }
+  if (baseRemoved === 0n) return;
+
+  let pct = 100;
+  try {
+    const base = new ethers.Contract(baseAddr, ERC20_ABI, provider);
+    const remaining = await base.balanceOf(log.address);
+    pct = Number((baseRemoved * 10000n) / (baseRemoved + remaining)) / 100;
+  } catch { /* balance read failed — treat as full removal */ }
+
+  const tx = await provider.getTransaction(log.transactionHash).catch(() => null);
+  const remover = tx?.from ? tx.from.toLowerCase() : null;
+
+  const s = await getStatus(m.mainAddr, { pairLabel: m.pairLabel });
+  const byDeployer = Boolean(remover && s.deployer && remover === s.deployer.toLowerCase());
+
+  // trigger rules: deployer removing anything, or anyone crossing the threshold
+  if (!byDeployer && pct < RUG_PCT) return;
+  if (!once(`rug:${poolKey}`, m.mainAddr)) return;
+
+  const isRug = pct >= RUG_PCT;
+  if (isRug) {
+    s.rugged = true;
+    s.lp = false;
+    addFlag("deployers", remover);
+    addFlag("tokens", m.mainAddr);
+    addFlag("codeHashes", s.codeHash);
+  }
+
+  const pctStr = pct >= 99.9 ? "~100" : pct.toFixed(1);
+  const who = remover
+    ? `Removed by: \`${remover}\`${byDeployer ? " \u2014 *THE DEPLOYER*" : ""}`
+    : "Remover unknown";
+  const line = `\u203C\uFE0F ${pctStr}% of liquidity removed (${ver.toUpperCase()})`;
+  if (!s.extraLines.includes(line)) s.extraLines.push(line, who);
+
+  s.header = isRug
+    ? `\u{1F6A8} *RUG PULL \u2014 LIQUIDITY REMOVED* \u2014 *${s.symbol}*`
+    : `\u26A0\uFE0F *DEPLOYER REMOVED LIQUIDITY* \u2014 *${s.symbol}*`;
+  await sendCard(m.mainAddr);
+}
+
 // ---------- DexScreener watcher ----------
 // Every token we card gets watched on DexScreener for DEX_WATCH_HOURS.
 // Sends: "LIVE ON DEXSCREENER" the first time it appears there, and
@@ -692,13 +814,16 @@ async function scanRange(from, to) {
   const liqLogs = await provider.getLogs({
     fromBlock: from,
     toBlock: to,
-    topics: [[TOPICS.V2_MINT, TOPICS.V3_MINT, TOPICS.PAIR_CREATED, TOPICS.POOL_CREATED]],
+    topics: [[TOPICS.V2_MINT, TOPICS.V3_MINT, TOPICS.PAIR_CREATED, TOPICS.POOL_CREATED, TOPICS.V2_BURN, TOPICS.V3_BURN]],
   });
   for (const log of liqLogs) {
     const t = log.topics[0];
     if (t === TOPICS.PAIR_CREATED || t === TOPICS.POOL_CREATED) {
       // birth certificate: remember this pool as genuinely new (no alert yet)
       registerNewPool(log);
+    } else if (t === TOPICS.V2_BURN || t === TOPICS.V3_BURN) {
+      // liquidity REMOVED — rug detection
+      await notifyLiqRemoval(log, t === TOPICS.V2_BURN ? "v2" : "v3");
     } else {
       // liquidity added: alert only if the pool was born under our watch
       await notifyLiquidity(log);
