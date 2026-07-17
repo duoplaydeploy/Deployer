@@ -5,11 +5,16 @@
 //   Run:  TG_TOKEN=xxx TG_CHAT=-100xxxx node deploy-watcher.js
 //
 // Env switches:
-//   EXCLUDE_NOXA=false  -> show NOXA Fun launch cards (default: true = NOXA fully hidden)
+//   HIDE_MEMES=false  -> also show meme-named tokens (default: true = memes hidden;
+//                        only RWA / Utility / Unclassified tokens are posted)
 //   RPC / EXPLORER / POLL_MS as before
 //
 const { ethers } = require("ethers");
-const TelegramBot = require("node-telegram-bot-api");
+// node-telegram-bot-api changed its export style in v1.x (June 2026):
+// 0.x exports the class directly, 1.x exports { TelegramBot }. Accept both so
+// a Railway rebuild that pulls a newer version can't crash the bot on boot.
+const tgLib = require("node-telegram-bot-api");
+const TelegramBot = tgLib.TelegramBot || tgLib.default || tgLib;
 const fs = require("fs");
 
 // ---------- config ----------
@@ -27,16 +32,13 @@ if (!TG_TOKEN || !TG_CHAT) {
 const provider = new ethers.JsonRpcProvider(RPC);
 const bot = new TelegramBot(TG_TOKEN, { polling: false });
 
-// ---------- NOXA Fun launchpad ----------
-// Official NOXA Launch Factory on Robinhood Chain (chain id 4663)
-// Source: https://docs.noxa.fi/contracts/noxa-fun/
-const NOXA_FACTORY = (
-  process.env.NOXA_FACTORY || "0xD9eC2db5f3D1b236843925949fe5bd8a3836FCcB"
-).toLowerCase();
-
-// Toggle: default true = NOXA fully hidden (it has its own platform).
-// Set EXCLUDE_NOXA=false in Railway if you ever want NOXA launch cards back.
-const EXCLUDE_NOXA = (process.env.EXCLUDE_NOXA || "true") === "true";
+// ---------- meme filter ----------
+// This channel is for RWA / utility launches. Tokens whose name/ticker clearly
+// reads as a meme are fully hidden (no cards, no DexScreener watching). Tokens
+// with no signal either way are "Unclassified" and STILL SHOWN — real projects
+// often have neutral names (e.g. "Arrow"), so unknowns must never be hidden.
+// Set HIDE_MEMES=false in Railway to show everything again.
+const HIDE_MEMES = (process.env.HIDE_MEMES || "true") === "true";
 
 // ---------- rug detection config + flag store ----------
 // Alert when >RUG_PCT % of a tracked pool's base-side liquidity is removed,
@@ -67,31 +69,6 @@ function addFlag(kind, key) {
   saveFlags();
 }
 
-// Factory event emitted on every NOXA launch
-// Source: https://docs.noxa.fi/integrations/launchpad/
-const NOXA_IFACE = new ethers.Interface([
-  "event TokenLaunched(address indexed token, address indexed deployer, address indexed dexFactory, address pairToken, address pool, uint256 dexId, uint256 launchConfigId, uint256 positionId, uint256 restrictionsEndBlock, uint256 initialBuyAmount)",
-]);
-const TOKEN_LAUNCHED_TOPIC = NOXA_IFACE.getEvent("TokenLaunched").topicHash;
-
-// Legacy treasury heuristic (fallback for direct deploys touching NOXA)
-const NOXA_TREASURY = "0x71f2f1c2dc94cdabfe29cb355119f8683ae0969b";
-
-// NOXA token/pool addresses we've seen (suppress duplicate generic alerts)
-const noxaAddrs = new Set();
-
-function isNoxaTx(receipt) {
-  for (const log of receipt.logs || []) {
-    const a = log.address?.toLowerCase();
-    if (a === NOXA_TREASURY || a === NOXA_FACTORY) return true;
-    for (const topic of log.topics || []) {
-      const t = "0x" + topic.slice(26).toLowerCase();
-      if (t === NOXA_TREASURY || t === NOXA_FACTORY) return true;
-    }
-  }
-  return false;
-}
-
 // ---------- ERC20 + pool ABIs ----------
 const ERC20_ABI = [
   "function balanceOf(address) view returns (uint256)",
@@ -108,14 +85,36 @@ const POOL_ABI = [
 // Base/quote tokens (WETH, USDC...) — the "other side" of a pair
 const BASE_SYMBOLS = /^(weth|eth|usdc|usdt|dai|wbtc|rbh-eth)$/i;
 
-const MEME_WORDS = /(doge?|inu|shib|pepe|elon|moon|floki|wojak|chad|meme|baby|safe|cum|cat|frog|bonk|wif|turbo|degen|rekt|ape|pump|\bhood\b|gme|wsb|tendies|stonk)/i;
-const UTILITY_WORDS = /(gov|dao|stake|vault|protocol|finance|swap|lend|oracle|bridge|usd|eth|wrapped|staked|reward|index|liquidity|yield)/i;
+// Meme words: matching one of these HIDES the token (when HIDE_MEMES is on),
+// so short common substrings (cat/ape/cum/gme/wsb) are word-bounded to avoid
+// hiding legit names like "Catalyst", "Grape", "Accumulate".
+const MEME_WORDS = /(doge?|inu|shib|pepe|elon|moon|floki|wojak|chad|meme|baby|safe|\bcum\b|\bcats?\b|frog|bonk|wif|turbo|degen|rekt|\bapes?\b|pump|\bhood\b|\bgme\b|\bwsb\b|tendies|stonk)/i;
+const UTILITY_WORDS = /(gov|dao|stake|vault|protocol|finance|swap|lend|oracle|bridge|usd|eth|wrapped|staked|reward|index|liquidity|yield|\bai\b)/i;
+// RWA-flavoured words get their own label — Robinhood is pushing real-world assets
+const RWA_WORDS = /(\brwa\b|real[\s-]?world|asset|tokeni[sz]|treasur|\bbonds?\b|estate|realt|propert|gold|silver|commodit|\bstocks?\b|equit|\betfs?\b|fund|credit|capital|invoice)/i;
 
+// Returns "rwa" | "utility" | "meme" | "unknown".
+// Checked in that order ON PURPOSE: a name that signals both ("Gold Doge") is
+// shown rather than hidden — missing a real project is worse than letting the
+// odd meme slip through. This is a name-based screen, not a verdict.
 function classify(name, symbol) {
   const hay = `${name} ${symbol}`.toLowerCase();
+  if (RWA_WORDS.test(hay)) return "rwa";
   if (UTILITY_WORDS.test(hay)) return "utility";
   if (MEME_WORDS.test(hay)) return "meme";
-  return "meme?";
+  return "unknown";
+}
+
+function clsLabel(cls) {
+  return cls === "rwa" ? "RWA"
+       : cls === "utility" ? "Utility"
+       : cls === "meme" ? "Meme"
+       : "Unclassified";
+}
+
+// hide rule: only confident memes are hidden, and only while HIDE_MEMES is on
+function isHiddenToken(s) {
+  return HIDE_MEMES && s?.cls === "meme";
 }
 
 // ---------- Blockscout verification check ----------
@@ -226,9 +225,10 @@ const DEAD_ADDRS = new Set([
   "0x0000000000000000000000000000000000000000",
   "0x000000000000000000000000000000000000dead",
 ]);
-const LOCKER_ADDRS = new Set([
-  "0x7f03effbd7ceb22a3f80dd468f67ef27826acd85", // NOXA Launch Locker (Robinhood Chain)
-]);
+// Known LP-locker contracts on this chain. Empty right now — the old NOXA
+// locker died with that platform (July 2026). Add locker addresses here as
+// locking services appear on Robinhood Chain; "🔒 LOCKED" cards resume then.
+const LOCKER_ADDRS = new Set([]);
 
 function topicAddr(topic) {
   return "0x" + topic.slice(26).toLowerCase();
@@ -256,9 +256,10 @@ function fmtSupply(supply, decimals) {
   return human.toLocaleString("en-US", { maximumFractionDigits: 0 });
 }
 
-// ---------- per-token status (one evolving card per token) ----------
-// addr(lower) -> everything we know about a token, including its Telegram
-// card message id so later events EDIT the same card instead of new messages.
+// ---------- per-token status ----------
+// addr(lower) -> everything we know about a token. The card is rebuilt from
+// this on every event and sent as a FRESH message (edit-in-place was tried and
+// deliberately removed — Telegram message ids live in RAM and die on redeploy).
 const tokenStatus = new Map();
 
 async function getStatus(addr, patch = {}) {
@@ -271,7 +272,8 @@ async function getStatus(addr, patch = {}) {
       symbol: info.isToken ? info.symbol : "?",
       supplyStr: info.isToken ? fmtSupply(info.supply, info.decimals) : null,
       isToken: info.isToken,
-      deployer: null, pool: null, noxa: false,
+      cls: info.isToken ? classify(info.name, info.symbol) : "unknown",
+      deployer: null, pool: null,
       deployed: true, verify: "none", launching: false, lp: false,
       renounce: "unknown", ownerAddr: null,
       tax: { known: false, buy: null, sell: null },
@@ -315,7 +317,7 @@ function statusChecklist(addr) {
   const [vIcon, vSub] =
     s.verify === "verified" ? ["✅", "Code human-readable on explorer"] :
     s.verify === "similar"  ? ["⚠️", "Unverified — bytecode matches a verified contract"] :
-                              ["❌", "Code human-readable on explorer"];
+                              ["❌", "Source code not verified on explorer"];
   const dexSub = d.live
     ? ([d.liq ? `Liquidity ${d.liq}` : null, d.mc ? `MC ${d.mc}` : null]
         .filter(Boolean).join(" · ") || "Indexed and trading")
@@ -377,7 +379,6 @@ function buildCard(addr) {
     `[Contract](${EXPLORER}/address/${addr})`,
     `[Holders](${EXPLORER}/token/${addr}?tab=holders)`,
     s.dex.url ? `[DexScreener](${s.dex.url})` : null,
-    s.noxa ? `[Trade](https://fun.noxa.fi/robinhood)` : null,
   ].filter(Boolean).join(" · ");
   lines.push(links);
   return lines.join("\n");
@@ -421,11 +422,6 @@ async function poolMainToken(poolAddr) {
   }
 }
 
-function poolIsNoxa(poolAddr, mainAddr) {
-  return noxaAddrs.has(poolAddr.toLowerCase()) ||
-         (mainAddr && noxaAddrs.has(mainAddr.toLowerCase()));
-}
-
 // ---------- new-pool tracking ----------
 // A pool only counts as NEW if we witnessed its creation event.
 // This stops liquidity top-ups on OLD pools from firing fake "LAUNCHING" alerts.
@@ -447,63 +443,16 @@ function registerNewPool(log) {
 
 // ---------- notifiers ----------
 
-// NOXA Fun launch (factory event) — token + pool + locked LP, all in one tx
-async function notifyNoxaLaunch(log) {
-  let ev;
-  try {
-    ev = NOXA_IFACE.parseLog({ topics: log.topics, data: log.data });
-  } catch (e) {
-    console.error("noxa decode failed:", e.message);
-    return;
-  }
-  const token = ev.args.token;
-  const pool = ev.args.pool;
-
-  // always register, even when muted, so generic alerts stay quiet about noxa
-  noxaAddrs.add(token.toLowerCase());
-  noxaAddrs.add(pool.toLowerCase());
-  seenPools.add(`launch:${pool.toLowerCase()}`);
-
-  if (EXCLUDE_NOXA) return;
-  if (!once("noxa", token)) return;
-
-  // NOXA tokens: deployed + instantly trading on V3 + LP locked forever in locker
-  const s = await getStatus(token, {
-    deployer: ev.args.deployer,
-    pool,
-    deployed: true,
-    launching: true,
-    lp: true,
-    noxa: true,
-    txHash: log.transactionHash,
-  });
-
-  try {
-    const pairInfo = await readToken(ev.args.pairToken);
-    if (pairInfo.isToken) s.pairLabel = `${s.symbol} / ${pairInfo.symbol}`;
-  } catch { /* koi baat nahi */ }
-
-  const buyLine = `Initial buy: ${ethers.formatEther(ev.args.initialBuyAmount)} ETH`;
-  if (!s.extraLines.includes(buyLine)) s.extraLines.push(buyLine);
-  s.header = `🟢 *NOXA FUN LAUNCH* (${classify(s.name, s.symbol)})`;
-  await sendCard(token);
-}
-
 // Direct contract deployment (someone deploys their own token)
 async function notifyDeploy(tx, receipt) {
   const addr = receipt.contractAddress;
 
-  // rare: direct deploy that touches noxa infra
-  if (isNoxaTx(receipt)) {
-    noxaAddrs.add(addr.toLowerCase());
-    if (EXCLUDE_NOXA) return;
-  }
-
   const s = await getStatus(addr, { deployer: tx.from, deployed: true, txHash: tx.hash });
-  if (!s.isToken) return; // not an ERC20 — skip
+  if (!s.isToken) return;       // not an ERC20 — skip
+  if (isHiddenToken(s)) return; // meme-named — tracked internally, never carded
   if (!once("deploy", addr)) return;
 
-  s.header = `🆕 *NEW TOKEN* (${classify(s.name, s.symbol)})`;
+  s.header = `🆕 *NEW TOKEN* (${clsLabel(s.cls)})`;
   await sendCard(addr);
   watchOnDexScreener(addr);
 }
@@ -520,8 +469,6 @@ async function notifyLiquidity(log) {
   const m = await poolMainToken(log.address);
   if (!m) { seenPools.add(launchKey); return; } // unreadable pool — skip silently
 
-  if (poolIsNoxa(log.address, m.mainAddr)) { seenPools.add(launchKey); return; }
-
   seenPools.add(launchKey);
   const s = await getStatus(m.mainAddr, {
     launching: true,
@@ -529,9 +476,10 @@ async function notifyLiquidity(log) {
     pairLabel: m.pairLabel,
   });
   if (!s.txHash) s.txHash = log.transactionHash;
+  if (isHiddenToken(s)) return; // meme-named — no launch card
   if (!once("launching", m.mainAddr)) return;
 
-  s.header = `🚀 *LAUNCHING* (${classify(s.name, s.symbol)})`;
+  s.header = `🚀 *LAUNCHING* (${clsLabel(s.cls)})`;
   await sendCard(m.mainAddr);
   watchOnDexScreener(m.mainAddr);
 }
@@ -550,7 +498,6 @@ async function notifyBurnLock(log, kind) {
 
   const m = await poolMainToken(log.address);
   if (!m) return; // not an LP token — normal token burn, ignore
-  if (poolIsNoxa(log.address, m.mainAddr)) return;
 
   seenPools.add(`${kind}:${key}`);
   const s = await getStatus(m.mainAddr, {
@@ -558,6 +505,7 @@ async function notifyBurnLock(log, kind) {
     launching: true,
     pairLabel: m.pairLabel,
   });
+  if (isHiddenToken(s)) return; // meme-named — no card
   if (!once(`lp:${kind}`, m.mainAddr)) return;
 
   const lpLine = `LP token: \`${log.address}\``;
@@ -573,8 +521,8 @@ async function notifyBurnLock(log, kind) {
 async function notifyRenounce(log) {
   const token = log.address.toLowerCase();
   const s = tokenStatus.get(token);
-  if (!s || !s.isToken) return;      // only tokens we've carded — keeps it launch-focused
-  if (noxaAddrs.has(token)) return;  // noxa stays out of the channel
+  if (!s || !s.isToken) return;   // only tokens we've tracked — keeps it launch-focused
+  if (isHiddenToken(s)) return;   // meme-named — no card
   if (!once("renounced", token)) return;
 
   s.renounce = "renounced";
@@ -595,7 +543,6 @@ async function notifyLiqRemoval(log, ver) {
   if (!newPools.has(poolKey)) return;           // only pools born under our watch
   const m = await poolMainToken(log.address);
   if (!m) return;
-  if (poolIsNoxa(log.address, m.mainAddr)) return;
 
   // amounts: V2 Burn data = [amount0, amount1]; V3 Burn data = [liquidity, amount0, amount1]
   const amt0 = ver === "v2" ? dataWord(log.data, 0) : dataWord(log.data, 1);
@@ -634,10 +581,13 @@ async function notifyLiqRemoval(log, ver) {
   if (isRug) {
     s.rugged = true;
     s.lp = false;
+    // record the rugger even for hidden meme tokens — the deployer blacklist
+    // protects future (utility) launches from the same wallet
     addFlag("deployers", remover);
     addFlag("tokens", m.mainAddr);
     addFlag("codeHashes", s.codeHash);
   }
+  if (isHiddenToken(s)) return; // meme-named — flags recorded above, no card posted
 
   const pctStr = pct >= 99.9 ? "~100" : pct.toFixed(1);
   const who = remover
@@ -721,7 +671,7 @@ async function pollDexScreener() {
       if (!s) continue; // watched tokens always have status, but be safe
       const dsUrl = p.url || `https://dexscreener.com/${DEX_CHAIN_ID}/${p.pairAddress}`;
 
-      // (1) first time this token shows up on DexScreener → flip #5 on its card
+      // (1) first time this token shows up on DexScreener → flip #6 on its card
       if (!w.live) {
         w.live = true;
         s.launching = true; // also backfills launches missed during downtime
@@ -737,7 +687,7 @@ async function pollDexScreener() {
       }
 
       // (2) profile links appeared or changed (usually = dev paid for token info)
-      //     → flip #6 on the card, show links on the card, ping with the links
+      //     → flip #7 on the card, show links on the card, ping with the links
       const links = [];
       for (const ws of p.info?.websites || []) {
         if (ws?.url) links.push(`[${linkLabel(ws.label || "website")}](${ws.url})`);
@@ -776,20 +726,7 @@ const RENOUNCE_TO_TOPICS = [...RENOUNCED_OWNERS].map(
 );
 
 async function scanRange(from, to) {
-  // A) NOXA launches — registers noxa pools before liquidity scanning
-  try {
-    const noxaLogs = await provider.getLogs({
-      fromBlock: from,
-      toBlock: to,
-      address: NOXA_FACTORY,
-      topics: [TOKEN_LAUNCHED_TOPIC],
-    });
-    for (const log of noxaLogs) await notifyNoxaLaunch(log);
-  } catch (e) {
-    console.error("noxa log scan error:", e.message);
-  }
-
-  // B) direct contract deployments — blocks fetched in parallel batches
+  // A) direct contract deployments — blocks fetched in parallel batches
   for (let n = from; n <= to; n += BLOCK_CHUNK) {
     const end = Math.min(n + BLOCK_CHUNK - 1, to);
     const blocks = await Promise.all(
@@ -810,7 +747,7 @@ async function scanRange(from, to) {
     }
   }
 
-  // C) pool creations + liquidity adds for the whole range (one call)
+  // B) pool creations + liquidity adds for the whole range (one call)
   const liqLogs = await provider.getLogs({
     fromBlock: from,
     toBlock: to,
@@ -830,7 +767,7 @@ async function scanRange(from, to) {
     }
   }
 
-  // D) LP burns/locks: ONLY transfers to dead/locker addresses (filtered by
+  // C) LP burns/locks: ONLY transfers to dead/locker addresses (filtered by
   //    the RPC node itself — the general Transfer firehose never reaches us)
   const blLogs = await provider.getLogs({
     fromBlock: from,
@@ -844,7 +781,7 @@ async function scanRange(from, to) {
     else if (LOCKER_ADDRS.has(dest)) await notifyBurnLock(log, "locked");
   }
 
-  // E) ownership renounces: OwnershipTransferred(old -> zero/dead), filtered
+  // D) ownership renounces: OwnershipTransferred(old -> zero/dead), filtered
   //    server-side so only actual renounces reach us
   const renLogs = await provider.getLogs({
     fromBlock: from,
@@ -858,8 +795,8 @@ async function scanRange(from, to) {
 async function main() {
   let last = await provider.getBlockNumber();
   console.log(`Watching ${RPC} from block ${last}`);
-  console.log(`NOXA factory: ${NOXA_FACTORY} (alerts ${EXCLUDE_NOXA ? "MUTED" : "ON"})`);
-  await send(`✅ Robinhood Chain watcher online. Starting at block ${last}. NOXA alerts: ${EXCLUDE_NOXA ? "off" : "on"}.`);
+  console.log(`Meme filter: ${HIDE_MEMES ? "ON (showing RWA / Utility / Unclassified only)" : "OFF (showing everything)"}`);
+  await send(`✅ Robinhood Chain watcher online. Starting at block ${last}. Meme tokens: ${HIDE_MEMES ? "hidden — showing RWA / Utility / Unclassified only" : "shown"}.`);
 
   // DexScreener watcher — runs independently of the block scanner
   setInterval(
