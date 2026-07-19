@@ -5,8 +5,10 @@
 //   Run:  TG_TOKEN=xxx TG_CHAT=-100xxxx node deploy-watcher.js
 //
 // Env switches:
-//   HIDE_MEMES=false  -> also show meme-named tokens (default: true = memes hidden;
-//                        only RWA / Utility / Unclassified tokens are posted)
+//   HIDE_MEMES=false   -> also show meme-named tokens (default: true = memes hidden;
+//                         only RWA / Utility / Unclassified tokens are posted)
+//   PONS_ALERTS=false  -> turn off Pons graduation cards (Pons launches are
+//                         always suppressed from the generic feed either way)
 //   RPC / EXPLORER / POLL_MS as before
 //
 const { ethers } = require("ethers");
@@ -39,6 +41,114 @@ const bot = new TelegramBot(TG_TOKEN, { polling: false });
 // often have neutral names (e.g. "Arrow"), so unknowns must never be hidden.
 // Set HIDE_MEMES=false in Railway to show everything again.
 const HIDE_MEMES = (process.env.HIDE_MEMES || "true") === "true";
+
+// ---------- Pons launchpad (ponsfamily.com) ----------
+// Pons is the launchpad that replaced NOXA in July 2026 — same contract design
+// rebuilt by a new team, with an IDENTICAL TokenLaunched event. Every Pons
+// launch mints the token AND opens a real Uniswap V3 WETH pool in one tx with
+// the liquidity locked, so WITHOUT special handling those launches (thousands
+// per day) flood the generic LAUNCHING feed.
+// Strategy (see HANDOFF for the reasoning):
+//   * listen to the Pons factories and register every token/pool — this
+//     suppresses them from the generic feed, like the old NOXA listener did
+//   * post ONE compact Pons card per token, at GRADUATION: per
+//     docs.ponsfamily.fi a launch graduates when the WETH side of its locked
+//     pool reaches the threshold (default 4.2 WETH). Nothing migrates.
+//   * count launches per creator from the factory's own event history
+// Addresses below are from docs.ponsfamily.fi (July 2026). New Pons versions
+// ship as NEW factory addresses — update PONS_FACTORIES env then.
+const PONS_ALERTS = (process.env.PONS_ALERTS || "true") === "true";
+const PONS_FACTORIES = (process.env.PONS_FACTORIES ||
+  "0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB," + // active factory (from block 8991118)
+  "0x0c37a24F5D23A486FA692d1500881d698B1F77a4"    // legacy factory (from block 8600612)
+).split(",").map((a) => a.trim().toLowerCase()).filter(Boolean);
+const PONS_START_BLOCK = Number(process.env.PONS_START_BLOCK || 8600612);
+// canonical WETH on Robinhood Chain (the quote side of every Pons pool)
+const WETH_ADDR = (process.env.WETH_ADDR ||
+  "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73").toLowerCase();
+const PONS_GRAD_WETH_STR = process.env.PONS_GRAD_WETH || "4.2";
+const PONS_GRAD_WETH = ethers.parseEther(PONS_GRAD_WETH_STR);
+// stop graduation-watching a launch after this many hours (nearly all
+// graduations happen within the first day; this bounds memory + RPC work)
+const PONS_WATCH_HOURS = Number(process.env.PONS_WATCH_HOURS || 72);
+// Pons token page link on cards — {ca} is replaced with the token address.
+// If Pons changes their URL layout, fix the env var; no code change needed.
+const PONS_TOKEN_URL = process.env.PONS_TOKEN_URL || "https://ponsfamily.com/token/{ca}";
+// Backfill the full launch history at startup so "Nth launch by this creator"
+// is accurate all-time, not just since the last redeploy.
+const PONS_BACKFILL = (process.env.PONS_BACKFILL || "true") === "true";
+const PONS_BACKFILL_CHUNK = Number(process.env.PONS_BACKFILL_CHUNK || 50000);
+
+// the exact event NOXA used — Pons kept the signature unchanged
+const PONS_IFACE = new ethers.Interface([
+  "event TokenLaunched(address indexed token, address indexed deployer, address indexed dexFactory, address pairToken, address pool, uint256 dexId, uint256 launchConfigId, uint256 positionId, uint256 restrictionsEndBlock, uint256 initialBuyAmount)",
+]);
+const PONS_LAUNCH_TOPIC = PONS_IFACE.getEvent("TokenLaunched").topicHash;
+
+// tokenLower -> { pool, deployer, launchBlock, live }
+// ("live" = launched while we were watching; historic entries only suppress)
+const ponsTokens = new Map();
+// poolLower -> tokenLower (fast lookup for suppression + graduation)
+const ponsPools = new Map();
+// deployerLower -> number of Pons launches seen (backfill + live)
+const ponsDeployerCount = new Map();
+// graduation watch: poolLower -> { weth: bigint|null, addedAt }
+const ponsGradWatch = new Map();
+
+function isPonsToken(addr) { return ponsTokens.has((addr || "").toLowerCase()); }
+function isPonsPool(addr) { return ponsPools.has((addr || "").toLowerCase()); }
+
+function registerPonsLaunch(log, live) {
+  let ev;
+  try { ev = PONS_IFACE.parseLog({ topics: log.topics, data: log.data }); }
+  catch { return null; }
+  const token = ev.args.token.toLowerCase();
+  const pool = ev.args.pool.toLowerCase();
+  const deployer = ev.args.deployer.toLowerCase();
+  if (!ponsTokens.has(token)) {
+    ponsDeployerCount.set(deployer, (ponsDeployerCount.get(deployer) || 0) + 1);
+  }
+  ponsTokens.set(token, { pool, deployer, launchBlock: log.blockNumber, live });
+  ponsPools.set(pool, token);
+  seenPools.add(`launch:${pool}`); // the generic launch path must never claim it
+  if (live && PONS_ALERTS && !ponsGradWatch.has(pool)) {
+    ponsGradWatch.set(pool, { weth: null, addedAt: Date.now() });
+  }
+  return { token, pool, deployer };
+}
+
+// give a token status object its Pons context (used by cards + suppression)
+function attachPonsInfo(tokenAddr, s) {
+  const t = ponsTokens.get(tokenAddr.toLowerCase());
+  if (!t) return;
+  s.pons = {
+    pool: t.pool,
+    launchBlock: t.launchBlock,
+    count: ponsDeployerCount.get(t.deployer) || 0,
+    gradMins: null,
+  };
+  if (!s.deployer) s.deployer = t.deployer;
+  s.lp = true;        // Pons locks pool liquidity at launch (per docs)
+  s.launching = true; // the pool trades from the launch block
+}
+
+function ordinal(n) {
+  const s = ["th", "st", "nd", "rd"], v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+
+// escape user-controlled text for Telegram Markdown so a weird token name
+// can't break the send
+function mdEscape(t) {
+  return String(t || "").replace(/([_*`\[\]])/g, "\\$1");
+}
+
+function fmtDuration(mins) {
+  if (mins < 60) return `${Math.max(1, Math.round(mins))}m`;
+  const h = Math.floor(mins / 60), m = Math.round(mins % 60);
+  if (h < 48) return m ? `${h}h ${m}m` : `${h}h`;
+  return `${Math.floor(h / 24)}d ${h % 24}h`;
+}
 
 // ---------- rug detection config + flag store ----------
 // Alert when >RUG_PCT % of a tracked pool's base-side liquidity is removed,
@@ -81,6 +191,8 @@ const POOL_ABI = [
   "function token0() view returns (address)",
   "function token1() view returns (address)",
 ];
+// WETH viewed as a plain ERC20 (balanceOf) — used for Pons graduation checks
+const WETH = new ethers.Contract(WETH_ADDR, ERC20_ABI, provider);
 
 // Base/quote tokens (WETH, USDC...) — the "other side" of a pair
 const BASE_SYMBOLS = /^(weth|eth|usdc|usdt|dai|wbtc|rbh-eth)$/i;
@@ -112,8 +224,10 @@ function clsLabel(cls) {
        : "Unclassified";
 }
 
-// hide rule: only confident memes are hidden, and only while HIDE_MEMES is on
+// hide rule: only confident memes are hidden, and only while HIDE_MEMES is on.
+// Pons tokens are never meme-filtered — they have their own compact card flow.
 function isHiddenToken(s) {
+  if (s?.pons) return false;
   return HIDE_MEMES && s?.cls === "meme";
 }
 
@@ -277,11 +391,11 @@ async function getStatus(addr, patch = {}) {
       deployed: true, verify: "none", launching: false, lp: false,
       renounce: "unknown", ownerAddr: null,
       tax: { known: false, buy: null, sell: null },
-      rugged: false, codeHash: null,
+      rugged: false, codeHash: null, pons: null,
       // card state
       header: "🆕 *NEW TOKEN*",
       pairLabel: null, txHash: null, extraLines: [],
-      dex: { live: false, url: null, links: [], liq: null, mc: null },
+      dex: { live: false, url: null, links: [], liq: null, mc: null, img: null },
     };
     tokenStatus.set(key, s);
     // contract code is immutable: if tax getters don't exist now, they never will,
@@ -337,12 +451,60 @@ function statusChecklist(addr) {
   ].join("\n");
 }
 
+// ---------- the compact Pons card ----------
+// No checklist, no classification: every Pons token is the same audited
+// template with liquidity locked at launch, so the per-contract safety rows
+// would be identical noise. What matters here is traction (graduation), the
+// creator's track record, and the links.
+function buildPonsCard(addr, s) {
+  const key = addr.toLowerCase();
+  const p = s.pons;
+  const lines = [s.header, ""];
+  const warn = [];
+  const dep = (s.deployer || "").toLowerCase();
+  if (dep && flags.deployers[dep]) {
+    warn.push(`\u26D4 *FLAGGED CREATOR* \u2014 pulled liquidity ${flags.deployers[dep]}\u00d7 before`);
+  }
+  if (flags.tokens[key] && !s.rugged) {
+    warn.push(`\u26D4 *THIS TOKEN RUGGED BEFORE*`);
+  }
+  // no bytecode warning on purpose: every Pons token shares the same template
+  // bytecode, so a code-hash match carries zero information here
+  if (warn.length) lines.push(...warn, "");
+  lines.push(`Launched on Pons 🅿️`);
+  lines.push(`Name: *${mdEscape(s.name)}*`);
+  lines.push(`Ticker: *${mdEscape(s.symbol)}*`);
+  if (s.supplyStr) lines.push(`Supply: ${s.supplyStr}`);
+  lines.push(`Pair: ${s.pairLabel || `${mdEscape(s.symbol)} / WETH`}`);
+  const stats = [s.dex.liq ? `Liquidity: ${s.dex.liq}` : null, s.dex.mc ? `MC: ${s.dex.mc}` : null]
+    .filter(Boolean).join(" · ");
+  if (stats) lines.push(stats);
+  if (s.deployer) {
+    const nth = p.count ? ` — their *${ordinal(p.count)}* Pons launch` : "";
+    lines.push(`Creator: \`${s.deployer}\`${nth}`);
+  }
+  if (p.gradMins != null) lines.push(`Graduated ~${fmtDuration(p.gradMins)} after launch`);
+  for (const ex of s.extraLines) lines.push(ex);
+  if (s.dex.links.length) lines.push("", `Links: ${s.dex.links.join(" · ")}`);
+  lines.push("", `CA: \`${addr}\``);
+  const links = [
+    `[Pons](${PONS_TOKEN_URL.replace("{ca}", addr)})`,
+    s.dex.url ? `[Chart](${s.dex.url})` : null,
+    `[Contract](${EXPLORER}/address/${addr})`,
+    p.pool ? `[Pool](${EXPLORER}/address/${p.pool})` : null,
+    `[Holders](${EXPLORER}/token/${addr}?tab=holders)`,
+  ].filter(Boolean).join(" · ");
+  lines.push(links);
+  return lines.join("\n");
+}
+
 // ---------- the evolving card ----------
 // Built entirely from tokenStatus, so it can be re-rendered after any change.
 function buildCard(addr) {
   const key = addr.toLowerCase();
   const s = tokenStatus.get(key);
   if (!s) return null;
+  if (s.pons) return buildPonsCard(addr, s); // Pons tokens: compact card
   const lines = [s.header, ""];
   // flag warnings — shown on every card of a matching token, right up top
   const warn = [];
@@ -357,8 +519,8 @@ function buildCard(addr) {
     warn.push(`\u26A0\uFE0F Code matches ${flags.codeHashes[s.codeHash]} prior rug(s) \u2014 may be a shared template`);
   }
   if (warn.length) lines.push(...warn, "");
-  lines.push(`Name: *${s.name}*`);
-  lines.push(`Ticker: *${s.symbol}*`);
+  lines.push(`Name: *${mdEscape(s.name)}*`);
+  lines.push(`Ticker: *${mdEscape(s.symbol)}*`);
   if (s.supplyStr) lines.push(`Supply: ${s.supplyStr}`);
   if (s.pairLabel) lines.push(`Pair: ${s.pairLabel}`);
   if (s.tax?.known) {
@@ -386,9 +548,24 @@ function buildCard(addr) {
 
 // post a fresh, complete card reflecting the token's CURRENT state.
 // Every event sends a new card — the newest card is always the full picture.
+// Pons cards ride along the token's image (from DexScreener) when one exists.
 async function sendCard(addr) {
   const text = buildCard(addr);
-  if (text) await send(text);
+  if (!text) return;
+  const s = tokenStatus.get(addr.toLowerCase());
+  const img = s?.pons ? s.dex?.img : null;
+  if (img && text.length <= 1000) { // photo captions cap at 1024 chars
+    try {
+      await bot.sendPhoto(TG_CHAT, img, {
+        caption: text,
+        parse_mode: "Markdown",
+      });
+      return;
+    } catch (e) {
+      console.error("tg photo failed, falling back to text:", e.message);
+    }
+  }
+  await send(text);
 }
 
 // one alert per token per stage
@@ -460,6 +637,8 @@ async function notifyDeploy(tx, receipt) {
 // First liquidity / new pool for a token
 async function notifyLiquidity(log) {
   const poolKey = log.address.toLowerCase();
+  // Pons launches are handled by the Pons flow — never card them here
+  if (ponsPools.has(poolKey)) { seenPools.add(`launch:${poolKey}`); return; }
   // old pool (created before we were watching) getting topped up — not a launch
   if (!newPools.has(poolKey)) return;
 
@@ -487,6 +666,8 @@ async function notifyLiquidity(log) {
 // LP tokens sent to dead address (burn) or a known locker (lock)
 async function notifyBurnLock(log, kind) {
   const key = log.address.toLowerCase();
+  // Pons liquidity is locked by the platform at launch — no card needed
+  if (ponsPools.has(key) || ponsTokens.has(key)) return;
   // only for pools born under our watch — old tokens burning LP isn't our launch feed
   if (!newPools.has(key)) return;
   if (seenPools.has(`${kind}:${key}`)) return;
@@ -512,7 +693,7 @@ async function notifyBurnLock(log, kind) {
   if (!s.extraLines.includes(lpLine)) s.extraLines.push(lpLine);
 
   const emoji = kind === "burnt" ? "🔥" : "🔒";
-  s.header = `${emoji} *LIQUIDITY ${kind === "burnt" ? "BURNED" : "LOCKED"}* — *${s.symbol}*`;
+  s.header = `${emoji} *LIQUIDITY ${kind === "burnt" ? "BURNED" : "LOCKED"}* — *${mdEscape(s.symbol)}*`;
   await sendCard(m.mainAddr);
   watchOnDexScreener(m.mainAddr);
 }
@@ -522,12 +703,13 @@ async function notifyRenounce(log) {
   const token = log.address.toLowerCase();
   const s = tokenStatus.get(token);
   if (!s || !s.isToken) return;   // only tokens we've tracked — keeps it launch-focused
+  if (s.pons || isPonsToken(token)) return; // Pons template — not our news
   if (isHiddenToken(s)) return;   // meme-named — no card
   if (!once("renounced", token)) return;
 
   s.renounce = "renounced";
   s.ownerAddr = null;
-  s.header = `🔑 *OWNERSHIP RENOUNCED* — *${s.symbol}*`;
+  s.header = `🔑 *OWNERSHIP RENOUNCED* — *${mdEscape(s.symbol)}*`;
   await sendCard(log.address);
 }
 
@@ -571,6 +753,9 @@ async function notifyLiqRemoval(log, ver) {
   const remover = tx?.from ? tx.from.toLowerCase() : null;
 
   const s = await getStatus(m.mainAddr, { pairLabel: m.pairLabel });
+  // liquidity leaving a LOCKED Pons pool is platform-level news — keep the
+  // alert, render it in the Pons card style, never meme-filter it
+  if (!s.pons && isPonsToken(m.mainAddr)) attachPonsInfo(m.mainAddr, s);
   const byDeployer = Boolean(remover && s.deployer && remover === s.deployer.toLowerCase());
 
   // trigger rules: deployer removing anything, or anyone crossing the threshold
@@ -585,7 +770,9 @@ async function notifyLiqRemoval(log, ver) {
     // protects future (utility) launches from the same wallet
     addFlag("deployers", remover);
     addFlag("tokens", m.mainAddr);
-    addFlag("codeHashes", s.codeHash);
+    // every Pons token shares the same template bytecode, so flagging its
+    // code hash would smear every Pons launch — only flag custom contracts
+    if (!s.pons) addFlag("codeHashes", s.codeHash);
   }
   if (isHiddenToken(s)) return; // meme-named — flags recorded above, no card posted
 
@@ -597,9 +784,50 @@ async function notifyLiqRemoval(log, ver) {
   if (!s.extraLines.includes(line)) s.extraLines.push(line, who);
 
   s.header = isRug
-    ? `\u{1F6A8} *RUG PULL \u2014 LIQUIDITY REMOVED* \u2014 *${s.symbol}*`
-    : `\u26A0\uFE0F *DEPLOYER REMOVED LIQUIDITY* \u2014 *${s.symbol}*`;
+    ? `\u{1F6A8} *RUG PULL \u2014 LIQUIDITY REMOVED* \u2014 *${mdEscape(s.symbol)}*`
+    : `\u26A0\uFE0F *DEPLOYER REMOVED LIQUIDITY* \u2014 *${mdEscape(s.symbol)}*`;
   await sendCard(m.mainAddr);
+}
+
+// ---------- Pons graduation ----------
+// Called when a watched Pons pool's WETH side reaches the threshold.
+// One compact card per token: name/ticker/supply, creator + their launch
+// count, time from launch to graduation, links + image from DexScreener.
+async function notifyPonsGraduation(poolLower) {
+  const tokenLower = ponsPools.get(poolLower);
+  const t = tokenLower ? ponsTokens.get(tokenLower) : null;
+  if (!t) return;
+  if (!once("pons-grad", tokenLower)) return;
+
+  const s = await getStatus(tokenLower, {
+    deployed: true,
+    launching: true,
+    lp: true,
+    pool: poolLower,
+    deployer: t.deployer,
+  });
+  attachPonsInfo(tokenLower, s);
+  if (!s.pairLabel) s.pairLabel = `${mdEscape(s.symbol)} / WETH`;
+
+  // launch → graduation time (~100ms blocks, so blocks*0.1s)
+  try {
+    const head = await provider.getBlockNumber();
+    if (head > t.launchBlock) s.pons.gradMins = ((head - t.launchBlock) * 0.1) / 60;
+  } catch { /* fine without it */ }
+
+  // pull whatever DexScreener already knows: image, links, liquidity, MC
+  await dexEnrich(tokenLower);
+
+  s.header = `🎓 *PONS GRADUATION* — *${mdEscape(s.symbol)}* cleared ${PONS_GRAD_WETH_STR} WETH`;
+  await sendCard(tokenLower);
+
+  // keep following it: LIVE / DEX INFO UPDATED cards will use the Pons style
+  watchOnDexScreener(tokenLower);
+  const w = dexWatch.get(tokenLower);
+  if (w) {
+    w.live = s.dex.live;
+    w.socialsKey = s.dex.links.slice().sort().join("|");
+  }
 }
 
 // ---------- DexScreener watcher ----------
@@ -631,6 +859,40 @@ function linkLabel(type) {
 
 function fmtUsd(n) {
   return "$" + Math.round(n).toLocaleString("en-US");
+}
+
+// one-shot DexScreener lookup used at Pons graduation time — fills in the
+// image, links, liquidity and market cap the moment the card goes out
+async function dexEnrich(token) {
+  try {
+    const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${token}`);
+    if (!res.ok) return;
+    const j = await res.json();
+    let bestP = null;
+    for (const p of j.pairs || []) {
+      if (p.chainId !== DEX_CHAIN_ID) continue;
+      if (p.baseToken?.address?.toLowerCase() !== token) continue;
+      if (!bestP || (p.liquidity?.usd || 0) > (bestP.liquidity?.usd || 0)) bestP = p;
+    }
+    if (!bestP) return;
+    const s = tokenStatus.get(token);
+    if (!s) return;
+    s.dex.live = true;
+    s.dex.url = bestP.url || `https://dexscreener.com/${DEX_CHAIN_ID}/${bestP.pairAddress}`;
+    if (bestP.liquidity?.usd) s.dex.liq = fmtUsd(bestP.liquidity.usd);
+    if (bestP.fdv) s.dex.mc = fmtUsd(bestP.fdv);
+    if (bestP.info?.imageUrl) s.dex.img = bestP.info.imageUrl;
+    const links = [];
+    for (const ws of bestP.info?.websites || []) {
+      if (ws?.url) links.push(`[${linkLabel(ws.label || "website")}](${ws.url})`);
+    }
+    for (const so of bestP.info?.socials || []) {
+      if (so?.url) links.push(`[${linkLabel(so.type)}](${so.url})`);
+    }
+    if (links.length) s.dex.links = links;
+  } catch (e) {
+    console.error("dex enrich error:", e.message);
+  }
 }
 
 async function pollDexScreener() {
@@ -670,6 +932,7 @@ async function pollDexScreener() {
       const s = tokenStatus.get(token);
       if (!s) continue; // watched tokens always have status, but be safe
       const dsUrl = p.url || `https://dexscreener.com/${DEX_CHAIN_ID}/${p.pairAddress}`;
+      if (p.info?.imageUrl) s.dex.img = p.info.imageUrl;
 
       // (1) first time this token shows up on DexScreener → flip #6 on its card
       if (!w.live) {
@@ -682,7 +945,7 @@ async function pollDexScreener() {
         if (!s.pairLabel && p.quoteToken?.symbol) {
           s.pairLabel = `${p.baseToken.symbol} / ${p.quoteToken.symbol}`;
         }
-        s.header = `📈 *LIVE ON DEXSCREENER* — *${s.symbol}*`;
+        s.header = `📈 *LIVE ON DEXSCREENER* — *${mdEscape(s.symbol)}*`;
         await sendCard(token);
       }
 
@@ -701,7 +964,7 @@ async function pollDexScreener() {
         w.socialsKey = keyNow;
         s.dex.links = links;
         s.dex.url = dsUrl;
-        s.header = `📣 *DEXSCREENER ${first ? "UPDATED" : "LINKS CHANGED"}* 🔥 — *${s.symbol}*`;
+        s.header = `📣 *DEXSCREENER ${first ? "UPDATED" : "LINKS CHANGED"}* 🔥 — *${mdEscape(s.symbol)}*`;
         await sendCard(token);
       }
     }
@@ -726,7 +989,21 @@ const RENOUNCE_TO_TOPICS = [...RENOUNCED_OWNERS].map(
 );
 
 async function scanRange(from, to) {
-  // A) direct contract deployments — blocks fetched in parallel batches
+  // A) Pons launches — MUST run before the pool/liquidity section so the same
+  //    transaction's Mint can't produce a generic LAUNCHING card
+  try {
+    const ponsLogs = await provider.getLogs({
+      fromBlock: from,
+      toBlock: to,
+      address: PONS_FACTORIES,
+      topics: [PONS_LAUNCH_TOPIC],
+    });
+    for (const log of ponsLogs) registerPonsLaunch(log, true);
+  } catch (e) {
+    console.error("pons launch scan error:", e.message);
+  }
+
+  // B) direct contract deployments — blocks fetched in parallel batches
   for (let n = from; n <= to; n += BLOCK_CHUNK) {
     const end = Math.min(n + BLOCK_CHUNK - 1, to);
     const blocks = await Promise.all(
@@ -747,7 +1024,7 @@ async function scanRange(from, to) {
     }
   }
 
-  // B) pool creations + liquidity adds for the whole range (one call)
+  // C) pool creations + liquidity adds for the whole range (one call)
   const liqLogs = await provider.getLogs({
     fromBlock: from,
     toBlock: to,
@@ -767,7 +1044,7 @@ async function scanRange(from, to) {
     }
   }
 
-  // C) LP burns/locks: ONLY transfers to dead/locker addresses (filtered by
+  // D) LP burns/locks: ONLY transfers to dead/locker addresses (filtered by
   //    the RPC node itself — the general Transfer firehose never reaches us)
   const blLogs = await provider.getLogs({
     fromBlock: from,
@@ -781,7 +1058,7 @@ async function scanRange(from, to) {
     else if (LOCKER_ADDRS.has(dest)) await notifyBurnLock(log, "locked");
   }
 
-  // D) ownership renounces: OwnershipTransferred(old -> zero/dead), filtered
+  // E) ownership renounces: OwnershipTransferred(old -> zero/dead), filtered
   //    server-side so only actual renounces reach us
   const renLogs = await provider.getLogs({
     fromBlock: from,
@@ -789,14 +1066,149 @@ async function scanRange(from, to) {
     topics: [TOPICS.OWNERSHIP_TRANSFERRED, null, RENOUNCE_TO_TOPICS],
   });
   for (const log of renLogs) await notifyRenounce(log);
+
+  // F) Pons graduation: a launch graduates when the WETH side of its locked
+  //    pool reaches the threshold (default 4.2 WETH). We pull WETH's Transfer
+  //    logs for the range (one address — cheap for the node), keep a running
+  //    balance for each watched pool, and CONFIRM with a real balanceOf
+  //    before announcing, so counter drift can never fake a graduation.
+  if (ponsGradWatch.size) {
+    // drop launches past the watch window — nearly all graduations happen in
+    // the first hours; this bounds memory and RPC work forever
+    const gCutoff = Date.now() - PONS_WATCH_HOURS * 3600 * 1000;
+    for (const [k, v] of ponsGradWatch) if (v.addedAt < gCutoff) ponsGradWatch.delete(k);
+  }
+  if (ponsGradWatch.size) {
+    let wLogs = null;
+    try {
+      wLogs = await provider.getLogs({
+        fromBlock: from,
+        toBlock: to,
+        address: WETH_ADDR,
+        topics: [TOPICS.TRANSFER],
+      });
+    } catch (e) {
+      console.error("weth transfer scan error:", e.message);
+      // running balances may now be missing deltas — null them so each pool
+      // re-seeds from a real balanceOf on its next activity (self-healing)
+      for (const v of ponsGradWatch.values()) v.weth = null;
+    }
+    if (wLogs) {
+      const touched = new Set();
+      for (const log of wLogs) {
+        if (log.topics.length !== 3) continue;
+        let val;
+        try { val = BigInt(log.data); } catch { continue; }
+        const toA = topicAddr(log.topics[2]);
+        const wIn = ponsGradWatch.get(toA);
+        if (wIn) { if (wIn.weth != null) wIn.weth += val; touched.add(toA); }
+        const fromA = topicAddr(log.topics[1]);
+        const wOut = ponsGradWatch.get(fromA);
+        if (wOut) { if (wOut.weth != null) wOut.weth -= val; touched.add(fromA); }
+      }
+      for (const pool of touched) {
+        const w = ponsGradWatch.get(pool);
+        if (!w) continue;
+        // first sighting of activity: seed the true balance once — the
+        // deltas above keep it fresh between confirmations
+        if (w.weth == null) {
+          try { w.weth = await WETH.balanceOf(pool); }
+          catch { continue; } // seed on the next activity instead
+        }
+        if (w.weth >= PONS_GRAD_WETH) {
+          let bal = w.weth;
+          try { bal = await WETH.balanceOf(pool); w.weth = bal; }
+          catch { /* keep the local estimate */ }
+          if (bal >= PONS_GRAD_WETH) {
+            ponsGradWatch.delete(pool); // graduated — done watching this one
+            await notifyPonsGraduation(pool);
+          }
+        }
+      }
+    }
+  }
+}
+
+// ---------- Pons launch-history backfill ----------
+// Runs once at startup: replays every TokenLaunched event from both Pons
+// factories so per-creator launch counts are ALL-TIME accurate and every
+// historic Pons token/pool is known (and therefore suppressed from the
+// generic feed). Historic pools are NOT graduation-watched — no old news.
+async function ponsBackfill(toBlock) {
+  if (!PONS_BACKFILL) {
+    console.log("pons backfill: disabled — creator counts start from zero");
+    return;
+  }
+  let from = PONS_START_BLOCK;
+  let chunk = PONS_BACKFILL_CHUNK;
+  let launches = 0;
+  let chunksDone = 0;
+  const t0 = Date.now();
+  console.log(`pons backfill: replaying launch history from block ${from} to ${toBlock}…`);
+  while (from <= toBlock) {
+    const to = Math.min(from + chunk - 1, toBlock);
+    try {
+      const logs = await provider.getLogs({
+        fromBlock: from,
+        toBlock: to,
+        address: PONS_FACTORIES,
+        topics: [PONS_LAUNCH_TOPIC],
+      });
+      for (const log of logs) if (registerPonsLaunch(log, false)) launches++;
+      from = to + 1;
+      chunksDone++;
+      if (chunksDone % 20 === 0) {
+        console.log(`pons backfill: at block ${to} — ${launches} launches so far`);
+      }
+    } catch (e) {
+      if (chunk > 2000) {
+        chunk = Math.floor(chunk / 2);
+        console.warn(`pons backfill: RPC rejected the range, retrying with ${chunk}-block chunks`);
+      } else {
+        console.error(
+          `pons backfill: giving up at block ${from} (${e.message}) — creator counts will be partial`
+        );
+        break;
+      }
+    }
+  }
+  console.log(
+    `pons backfill: ${launches} launches by ${ponsDeployerCount.size} creators, ` +
+    `${Math.round((Date.now() - t0) / 1000)}s`
+  );
 }
 
 // ---------- main loop ----------
 async function main() {
   let last = await provider.getBlockNumber();
+
+  // replay the Pons launch history first (creator counts + suppression),
+  // then close the gap that opened while the backfill was running — so a
+  // launch can never slip into the generic feed between the two
+  await ponsBackfill(last);
+  try {
+    const head2 = await provider.getBlockNumber();
+    if (head2 > last) {
+      const logs = await provider.getLogs({
+        fromBlock: last + 1,
+        toBlock: head2,
+        address: PONS_FACTORIES,
+        topics: [PONS_LAUNCH_TOPIC],
+      });
+      for (const log of logs) registerPonsLaunch(log, true);
+    }
+  } catch (e) {
+    console.error("pons catch-up scan error:", e.message);
+  }
+
   console.log(`Watching ${RPC} from block ${last}`);
   console.log(`Meme filter: ${HIDE_MEMES ? "ON (showing RWA / Utility / Unclassified only)" : "OFF (showing everything)"}`);
-  await send(`✅ Robinhood Chain watcher online. Starting at block ${last}. Meme tokens: ${HIDE_MEMES ? "hidden — showing RWA / Utility / Unclassified only" : "shown"}.`);
+  console.log(`Pons: launches tracked & suppressed, graduation cards ${PONS_ALERTS ? "ON" : "OFF"}`);
+  await send(
+    `✅ Robinhood Chain watcher online. Starting at block ${last}. ` +
+    `Meme tokens: ${HIDE_MEMES ? "hidden — showing RWA / Utility / Unclassified only" : "shown"}. ` +
+    `Pons launchpad: graduation cards ${PONS_ALERTS ? "on" : "off"}.`
+  );
 
   // DexScreener watcher — runs independently of the block scanner
   setInterval(
